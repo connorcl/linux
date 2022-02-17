@@ -100,6 +100,11 @@ pub use crate::types::{bit, bits_iter, Bool, False, Mode, Opaque, ScopeGuard, Tr
 
 use core::marker::PhantomData;
 
+// module for Rust interfaces required by Yama Rust port
+// TODO: once more complete, components should be moved
+//       out into various separate modules
+pub mod yama_rust_interfaces;
+
 /// Page size defined in terms of the `PAGE_SHIFT` macro from C.
 ///
 /// [`PAGE_SHIFT`]: ../../../include/asm-generic/page.h

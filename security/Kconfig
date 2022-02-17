@@ -228,6 +228,7 @@ source "security/yama/Kconfig"
 source "security/safesetid/Kconfig"
 source "security/lockdown/Kconfig"
 source "security/landlock/Kconfig"
+source "security/yama_rust/Kconfig"
 
 source "security/integrity/Kconfig"
 
