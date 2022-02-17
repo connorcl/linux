@@ -25,6 +25,18 @@
 #include <linux/amba/bus.h>
 #include <linux/gpio/driver.h>
 
+#include <linux/lsm_hooks.h>
+#include <linux/sched.h>
+#include <linux/capability.h>
+#include <linux/cred.h>
+#include <linux/rcupdate.h>
+#include <linux/preempt.h>
+#include <linux/yama_rust_c_exports.h>
+#include <linux/ptrace.h>
+#include <linux/prctl.h>
+#include <uapi/linux/prctl.h>
+#include <linux/sched/signal.h>
+
 // `bindgen` gets confused at certain things
 const gfp_t BINDINGS_GFP_KERNEL = GFP_KERNEL;
 const gfp_t BINDINGS___GFP_ZERO = __GFP_ZERO;

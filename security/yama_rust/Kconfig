@@ -1,0 +1,8 @@
+config SECURITY_YAMA_RUST
+	bool "Yama-Rust support (WIP)"
+	depends on SECURITY && RUST
+	default n
+	help
+	  This option enables a Rust port of Yama.
+
+	  If you are unsure how to answer this question, answer N.
