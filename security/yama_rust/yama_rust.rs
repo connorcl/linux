@@ -21,229 +21,235 @@ const YAMA_RUST_SCOPE_RELATIONAL: c_int = 1;
 const YAMA_RUST_SCOPE_CAPABILITY: c_int = 2;
 const YAMA_RUST_SCOPE_NO_ATTACH: c_int = 3;
 
-static mut PTRACE_SCOPE: c_int = YAMA_RUST_SCOPE_CAPABILITY;
+static mut PTRACE_SCOPE: c_int = YAMA_RUST_SCOPE_RELATIONAL;
 
-struct PtraceRelation {
-    pub(crate) tracer: *mut task_struct,
-    pub(crate) tracee: *mut task_struct,
-    pub(crate) invalid: bool,
-    links: Links<PtraceRelation>,
+#[derive(Clone)]
+enum PtraceRelation {
+    AnyTracer { tracee: TaskStructRef },
+    TracerTracee { tracer: TaskStructRef, tracee: TaskStructRef },
 }
 
 impl PtraceRelation {
-    pub(crate) fn new(tracer: *mut task_struct, tracee: *mut task_struct, invalid: bool) -> PtraceRelation {
-        return PtraceRelation {
-            tracer,
-            tracee,
+    fn get_tracee(&self) -> TaskStructRef {
+        match self {
+            PtraceRelation::AnyTracer { tracee } => {
+                tracee.clone()
+            },
+            PtraceRelation::TracerTracee { tracer, tracee } => {
+                tracee.clone()
+            }
+        }
+    }
+}
+
+struct PtraceRelationNode {
+    relation: PtraceRelation,
+    pub(crate) invalid: bool,
+    links: Links<PtraceRelationNode>,
+}
+
+impl PtraceRelationNode {
+    pub(crate) fn new(relation: PtraceRelation, invalid: bool) -> PtraceRelationNode {
+        return PtraceRelationNode {
+            relation,
             invalid,
             links: Links::new(),
         }
     }
 }
 
-impl GetLinks for PtraceRelation {
-    type EntryType = PtraceRelation;
+impl GetLinks for PtraceRelationNode {
+    type EntryType = PtraceRelationNode;
 
     fn get_links(data: &Self::EntryType) -> &Links<Self::EntryType> {
         return &data.links;
     }
 }
 
-type PtraceRelationList = List<Box<PtraceRelation>>;
+type PtraceRelationList = List<Box<PtraceRelationNode>>;
 type PtraceRelationListContainer = Pin<Box<SpinLock<PtraceRelationList>>>;
 
 static mut ptracer_relations: Option<PtraceRelationListContainer> = None;
 
-unsafe fn yama_relation_cleanup() {
-    unsafe {
-        // mutably borrow spinlock-protected list if present
-        if let Some(ref mut p) = &mut ptracer_relations {
-            // lock spinlock to mutably borrow the inner list
-            let list = &mut *p.lock();
-            // get a cursor pointing to the first element of the list
-            let mut cursor = list.cursor_front_mut();
-            // unwrap each element of the list in turn, moving the cursor along
-            while let Some(relation) = cursor.current() {
-                // check if the relation is invalid and remove if so
-                if relation.invalid {
-                    // this returns a Box, meaning the underlying element is deallocated
-                    // once the Box goes out of scope
-                    pr_info!("Removing invalid relationship!\n");
-                    cursor.remove_current();
-                } else {
-                    cursor.move_next();
-                }
-            }
-        }
-    }
-}
-
-unsafe fn yama_ptracer_add(tracer: *mut task_struct, tracee: *mut task_struct) {    
-    unsafe {
-        // mutably borrow spinlock-protected list if present
-        if let Some(ref mut p) = &mut ptracer_relations {
-            // lock spinlock to mutably borrow the inner list
-            let list = &mut *p.lock();
-            // get a cursor pointing to the first element of the list
-            let mut cursor = list.cursor_front_mut();
-            // unwrap each element of the list in turn, moving the cursor along
-            while let Some(relation) = cursor.current() {
-                if !relation.invalid {
-                    // update tracer if an existing relationship is present
-                    if relation.tracee == tracee {
-                        pr_info!("Updating relationship!\n");
-                        relation.tracer = tracer;
-                        return;
-                    }
-                }
+fn yama_relation_cleanup() {
+    // mutably borrow spinlock-protected list if present
+    if let Some(ref mut p) = unsafe { &mut ptracer_relations } {
+        // lock spinlock to mutably borrow the inner list
+        let list = &mut *p.lock();
+        // get a cursor pointing to the first element of the list
+        let mut cursor = list.cursor_front_mut();
+        // unwrap each element of the list in turn, moving the cursor along
+        while let Some(relation) = cursor.current() {
+            // check if the relation is invalid and remove if so
+            if relation.invalid {
+                // this returns a Box, meaning the underlying element is deallocated
+                // once the Box goes out of scope
+                pr_info!("Removing invalid relationship!\n");
+                cursor.remove_current();
+            } else {
                 cursor.move_next();
             }
-            pr_info!("Adding new relationship!\n");
-            // if an existing relationship wasn't found, add a new one
-            list.push_back(Box::try_new(PtraceRelation::new(tracer, tracee, false)).unwrap());
         }
     }
 }
 
-unsafe fn yama_ptracer_del(tracer: *mut task_struct, tracee: *mut task_struct) {
-    unsafe {
-        // mutably borrow spinlock-protected list if present
-        if let Some(ref mut p) = &mut ptracer_relations {
-            // lock spinlock to mutably borrow the inner list
-            let list = &mut *p.lock();
-            // get a cursor pointing to the first element of the list
-            let mut cursor = list.cursor_front_mut();
-            let mut count = 0;
-            // unwrap each element of the list in turn, moving the cursor along
-            while let Some(relation) = cursor.current() {
-                count = count + 1;
-                if !relation.invalid {
-                    if relation.tracee == tracee || 
-                        (tracer != null_mut() && relation.tracer == tracer) {
+fn yama_ptracer_add(relation: PtraceRelation) {
+    // mutably borrow spinlock-protected list if present
+    if let Some(ref mut p) = unsafe { &mut ptracer_relations } {
+        // lock spinlock to mutably borrow the inner list
+        let list = &mut *p.lock();
+        // get a cursor pointing to the first element of the list
+        let mut cursor = list.cursor_front_mut();
+        // unwrap each element of the list in turn, moving the cursor along
+        while let Some(relation_node) = cursor.current() {
+            if !relation_node.invalid {
+                // update tracer if an existing relationship is present
+                if relation_node.relation.get_tracee() == relation.get_tracee() {
+                    pr_info!("Updating relationship!\n");
+                    relation_node.relation = relation;
+                    return;
+                }
+            }
+            cursor.move_next();
+        }
+        pr_info!("Adding new relationship!\n");
+        // if an existing relationship wasn't found, add a new one
+        list.push_back(Box::try_new(PtraceRelationNode::new(relation, false)).unwrap());
+    }
+}
+
+fn yama_ptracer_del(tracer_task: Option<TaskStructRef>, tracee_task: Option<TaskStructRef>) {
+    // mutably borrow spinlock-protected list if present
+    if let Some(ref mut p) = unsafe { &mut ptracer_relations } {
+        // lock spinlock to mutably borrow the inner list
+        let list = &mut *p.lock();
+        // get a cursor pointing to the first element of the list
+        let mut cursor = list.cursor_front_mut();
+        // let mut count = 0;
+        // unwrap each element of the list in turn, moving the cursor along
+        while let Some(relation_node) = cursor.current() {
+            // count = count + 1;
+            if !relation_node.invalid {
+                // obs - help consider borrowing here - move during loop
+                if let Some(ref t) = tracer_task {
+                    // obs - help consider borrowing here
+                    if let PtraceRelation::TracerTracee { tracer, tracee } = &relation_node.relation {
+                        if *t == *tracer {
+                            pr_info!("Found match, marking relationship as invalid!\n");
+                            relation_node.invalid = true;
+                        }
+                    }
+                }
+                // obs - help consider borrowing here - move during loop
+                if let Some(ref t) = tracee_task {
+                    if *t == relation_node.relation.get_tracee() {
                         pr_info!("Found match, marking relationship as invalid!\n");
-                        relation.invalid = true;
+                        relation_node.invalid = true;
                     }
                 }
-                cursor.move_next();
             }
-            pr_info!("Relationships: {}\n", count);
+            cursor.move_next();
         }
-
-        yama_relation_cleanup();
+        // pr_info!("Relationships: {}\n", count);
     }
+
+    yama_relation_cleanup();
 }
 
-unsafe fn pid_alive(task: *mut task_struct) -> bool {
-    unsafe {
-        (*task).thread_pid != null_mut()
+fn task_is_descendant(parent: TaskStructRef, child: TaskStructRef) -> bool {
+
+    if parent.null() || child.null() {
+        return false;
     }
-}
 
-unsafe fn thread_group_leader(task: *mut task_struct) -> bool {
-    unsafe {
-        (*task).exit_signal >= 0
-    }
-}
+    let mut ret = false;
 
-unsafe fn task_is_descendant(mut parent: *mut task_struct, child: *mut task_struct) -> bool {
-    unsafe {
-        if parent == null_mut() || child == null_mut() {
-            return false;
-        }
+    with_rcu_read_lock(|| {
 
-        let mut ret = false;
-        let mut walker: *mut task_struct = child;
+        let mut parent = unsafe {
+            parent.get_thread_group_leader()
+        };
+        let mut walker = child;
 
-        rcu_read_lock_exported();
-
-        if !thread_group_leader(parent) {
-            parent = rcu_dereference_exported(&mut (*parent).group_leader as *mut *mut _ as *mut *mut c_void) as *mut task_struct;
-        }
-
-        while (*walker).pid > 0 {
-            if !thread_group_leader(walker) {
-                walker = rcu_dereference_exported(&mut (*walker).group_leader as *mut *mut _ as *mut *mut c_void) as *mut task_struct;
-            }
+        while walker.pid() > 0 {
+            walker = unsafe {
+                walker.get_thread_group_leader()
+            };
             if walker == parent {
                 ret = true;
                 break;
             }
-            walker = rcu_dereference_exported(&mut (*walker).real_parent as *mut *mut _ as *mut *mut c_void) as *mut task_struct;
-        }        
-
-        rcu_read_unlock_exported();
-        
-        ret
-    }
+            walker = unsafe {
+                walker.get_real_parent()
+            };
+        }
+    });
+    
+    ret
 }
 
-unsafe fn ptracer_exception_found(tracer: *mut task_struct, mut tracee: *mut task_struct) -> bool {
-    unsafe {
-
+fn ptracer_exception_found(tracer_task: TaskStructRef, tracee_task: TaskStructRef) -> bool {
+    with_rcu_read_lock(|| {
         let mut found = false;
-
-        rcu_read_lock_exported();
-
-        let mut parent = ptrace_parent_exported(tracee);
-        if parent != null_mut() && same_thread_group_exported(parent, tracer) {
-            pr_info!("Parent: {}, tracer: {}\n", (*parent).pid, (*tracer).pid);
-            rcu_read_unlock_exported();
+        let mut tracee_task = tracee_task;
+        let mut parent = unsafe {
+            tracee_task.get_ptrace_parent()
+        };
+        if !parent.null() && parent.same_thread_group(&tracer_task) {
+            pr_info!("Parent: {}, tracer: {}\n", parent.pid(), parent.pid());
             pr_info!("Existing trace relationship!\n");
             return true;
         }
 
-        if !thread_group_leader(tracee) {
-            tracee = rcu_dereference_exported(&mut (*tracee).group_leader as *mut *mut _ as *mut *mut c_void) as *mut task_struct;
-        }
+        tracee_task = unsafe { 
+            tracee_task.get_thread_group_leader()
+        };
+
+        // obs - more elegant than bool, null pointer
+        let mut relation: Option<PtraceRelation> = None;
 
         // mutably borrow spinlock-protected list if present
-        if let Some(ref mut p) = &mut ptracer_relations {
+        if let Some(ref mut p) = unsafe { &mut ptracer_relations } {
             // lock spinlock to mutably borrow the inner list
             let list = &mut *p.lock();
             // get a cursor pointing to the first element of the list
             let mut cursor = list.cursor_front_mut();
             // unwrap each element of the list in turn, moving the cursor along
-            while let Some(relation) = cursor.current() {
-                if !relation.invalid {
-                    if relation.tracee == tracee {
-                        parent = relation.tracer;
-                        found = true;
+            while let Some(relation_node) = cursor.current() {
+                if !relation_node.invalid {
+                    if relation_node.relation.get_tracee() == tracee_task {
+                        relation = Some(relation_node.relation.clone());
                         break;
-                    }   
+                    }
                 }
                 cursor.move_next();
             }
         }
 
-        if found && (parent == null_mut() || task_is_descendant(parent, tracer)) {
-            rcu_read_unlock_exported();
-            return true;
+        if let Some(r) = relation {
+            match r {
+                PtraceRelation::AnyTracer { tracee } => {
+                    return true;
+                },
+                PtraceRelation::TracerTracee { tracer, tracee } => {
+                    if task_is_descendant(tracer, tracer_task) {
+                        return true;
+                    }
+                }
+            }
         }
 
         return false;
-    }
+    })
 }
 
 struct TestRustLSM;
 
 impl SecurityHooks for TestRustLSM {
 
-    // fn bprm_check_security() -> Result {
-    //     pr_info!("BPRM hook method executed successfully!\n");
-    //     return Ok(());
-    // }
-
-    fn ptrace_access_check(child: *mut task_struct, mode: c_uint) -> Result {
+    fn ptrace_access_check(child: TaskStructRef, mode: c_uint) -> Result {
 
         pr_info!("Ptrace access check!\n");
-
-        unsafe {
-            let mut c = get_current_exported();
-            let mut parent = ptrace_parent_exported(child);
-            if parent != null_mut() {
-                pr_info!("child's parent: {}\n", (*parent).pid);
-            }
-        }
 
         let mut ret = Ok(());
 
@@ -256,42 +262,42 @@ impl SecurityHooks for TestRustLSM {
                     ret = Ok(());
                 },
                 YAMA_RUST_SCOPE_RELATIONAL => {
-                    unsafe { rcu_read_lock_exported(); }
-                    let child_alive =  unsafe { 
-                        pid_alive(child)
-                    };
-                    let is_descendant = unsafe {
-                        task_is_descendant(get_current_exported(), child)
-                    };
-                    let exception_found = unsafe {
-                        ptracer_exception_found(get_current_exported(), child)
-                    };
-                    let has_capability = unsafe {
-                        ns_capable_exported(
-                            (*__task_cred_exported(child)).user_ns,
-                            CAP_SYS_PTRACE.try_into().unwrap(),
-                        ) > 0
-                    };
-                    pr_info!("Alive: {}, Capability: {}, Is Descendant: {}, Exception: {}\n", child_alive, has_capability, is_descendant, exception_found);
-                    if child_alive && !is_descendant && !exception_found && !has_capability {
-                        pr_info!("Denied!\n");
-                        ret = Err(Error::EPERM);
-                    }
-                    unsafe { rcu_read_unlock_exported(); }
+                    ret = with_rcu_read_lock(|| {
+                        let child_alive =  unsafe { 
+                            child.pid_alive()
+                        };
+                        let is_descendant = unsafe {
+                            task_is_descendant(TaskStructRef::current(), child.clone())
+                        };
+                        let exception_found = unsafe {
+                            ptracer_exception_found(TaskStructRef::current(), child.clone())
+                        };
+                        let has_capability = unsafe {
+                            child.user_ns_capable(CAP_SYS_PTRACE)
+                        };
+                        pr_info!("Alive: {}, Capability: {}, Is Descendant: {}, Exception: {}\n", child_alive, has_capability, is_descendant, exception_found);
+                        if child_alive && !is_descendant && !exception_found && !has_capability {
+                            pr_info!("Denied!\n");
+                            Err(Error::EPERM)
+                        } else {
+                            Ok(())
+                        }
+                    })
+
+
                 },
                 YAMA_RUST_SCOPE_CAPABILITY => {
-                    unsafe { rcu_read_lock_exported(); }
-                    let has_capability = unsafe {
-                        ns_capable_exported(
-                            (*__task_cred_exported(child)).user_ns,
-                            CAP_SYS_PTRACE.try_into().unwrap(),
-                        ) != 0
-                    };
-                    if !has_capability {
-                        pr_info!("Denied!\n");
-                        ret = Err(Error::EPERM);
-                    }
-                    unsafe { rcu_read_unlock_exported(); }
+                    ret = with_rcu_read_lock(|| {
+                        let has_capability = unsafe {
+                            child.user_ns_capable(CAP_SYS_PTRACE)
+                        };
+                        if !has_capability {
+                            pr_info!("Denied!\n");
+                            Err(Error::EPERM)
+                        } else {
+                            Ok(())
+                        }
+                    })
                 },
                 YAMA_RUST_SCOPE_NO_ATTACH => {
                     pr_info!("Denied!\n");
@@ -307,69 +313,81 @@ impl SecurityHooks for TestRustLSM {
         return ret;
     }
 
-    fn ptrace_traceme(parent: *mut task_struct) -> Result {
-        unsafe {
+    fn ptrace_traceme(parent: TaskStructRef) -> Result {
 
-            let mut ret = Ok(());
+        let mut ret = Ok(());
 
-            if PTRACE_SCOPE == YAMA_RUST_SCOPE_CAPABILITY {
-                let has_capability = unsafe {
-                   has_ns_capability(parent, current_user_ns_exported(), CAP_SYS_PTRACE.try_into().unwrap())
-                };
-                if !has_capability {
-                    ret = Err(Error::EPERM);
-                    pr_info!("Traceme denied!\n");
+        if unsafe { PTRACE_SCOPE } == YAMA_RUST_SCOPE_CAPABILITY {
+            let has_capability = unsafe {
+                unsafe {
+                    has_ns_capability(parent.get_ptr(), current_user_ns_exported(), CAP_SYS_PTRACE.try_into().unwrap())
                 }
-            } else if PTRACE_SCOPE == YAMA_RUST_SCOPE_NO_ATTACH {
-                pr_info!("Traceme denied!\n");
+            };
+            if !has_capability {
                 ret = Err(Error::EPERM);
-            } else {
-                pr_info!("Traceme permitted!\n");
+                pr_info!("Traceme denied!\n");
             }
-
-            return ret;
+        } else if unsafe { PTRACE_SCOPE } == YAMA_RUST_SCOPE_NO_ATTACH {
+            pr_info!("Traceme denied!\n");
+            ret = Err(Error::EPERM);
+        } else {
+            pr_info!("Traceme permitted!\n");
         }
+
+        return ret;
     }
 
-    fn task_free(task: *mut task_struct) {
-        unsafe { yama_ptracer_del(task, task); }
+    fn task_free(task: TaskStructRef) {
+        unsafe { 
+            yama_ptracer_del(Some(task.clone()), Some(task.clone()));
+        }
     }
 
     fn task_prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) -> Result {
         
         let mut ret = Err(Error::ENOSYS);
-        let mut myself = unsafe { get_current_exported() };
 
-        unsafe {
-            if option == PR_SET_PTRACER as c_int {
-                rcu_read_lock_exported();
-                if !thread_group_leader(myself) {
-                    myself = rcu_dereference_exported(&mut (*myself).group_leader as *mut *mut _ as *mut *mut c_void) as *mut task_struct;
+        if option == PR_SET_PTRACER as c_int {
+
+            let mut myself = with_rcu_read_lock(|| {
+                unsafe {
+                    TaskStructRef::current_get().get_thread_group_leader()
                 }
-                get_task_struct_exported(myself);
-                rcu_read_unlock_exported();
+            });
 
-                // no tracing permitted
-                if arg2 == 0 {
-                    pr_info!("Removing tracee relationship!\n");
-                    yama_ptracer_del(null_mut(), myself);
-                    ret = Ok(());
-                } else if arg2 as i32 == -1 {
-                    pr_info!("Adding tracee relationship: any tracer!\n");
-                    yama_ptracer_add(null_mut(), myself);
+            // no tracing permitted
+            if arg2 == 0 {
+                pr_info!("Removing tracee relationship!\n");
+                let null_task = unsafe {
+                    TaskStructRef::from_ptr(null_mut())
+                };
+                yama_ptracer_del(None, Some(myself));
+                ret = Ok(());
+            } else if arg2 as i32 == -1 {
+                pr_info!("Adding tracee relationship: any tracer!\n");
+                let null_task = unsafe {
+                    TaskStructRef::from_ptr(null_mut())
+                };
+                yama_ptracer_add(PtraceRelation::AnyTracer {
+                    tracee: myself,
+                });
+            } else {
+                pr_info!("Adding tracee relationship!\n");
+                let tracer = unsafe {
+                    find_get_task_by_vpid(arg2 as pid_t)
+                };
+                if tracer == null_mut() {
+                    ret = Err(Error::EINVAL);
                 } else {
-                    pr_info!("Adding tracee relationship!\n");
-                    let tracer = find_get_task_by_vpid(arg2 as pid_t);
-                    if tracer == null_mut() {
-                        ret = Err(Error::EINVAL);
-                    } else {
-                        yama_ptracer_add(tracer, myself);
-                        ret = Ok(());
-                        put_task_struct_exported(tracer);
-                    }
+                    let tracer = unsafe {
+                        TaskStructRef::from_ptr(tracer)
+                    };
+                    yama_ptracer_add(PtraceRelation::TracerTracee {
+                        tracer: tracer,
+                        tracee: myself,
+                    });
+                    ret = Ok(());
                 }
-                put_task_struct_exported(myself);
-
             }
         }
         
