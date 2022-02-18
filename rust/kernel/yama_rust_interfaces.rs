@@ -5,6 +5,7 @@ use crate::error::Error;
 use crate::str::CStr;
 use core::marker::PhantomData;
 use alloc::boxed::Box;
+use core::convert::TryInto;
 
 
 pub struct SecurityHookList {
@@ -50,15 +51,15 @@ pub trait SecurityHooks {
         return Ok(());
     }
 
-    fn ptrace_access_check(child: *mut task_struct, mode: c_uint) -> Result {
+    fn ptrace_access_check(child: TaskStructRef, mode: c_uint) -> Result {
         return Ok(());
     }
 
-    fn ptrace_traceme(parent: *mut task_struct) -> Result {
+    fn ptrace_traceme(parent: TaskStructRef) -> Result {
         return Ok(());
     }
 
-    fn task_free(task: *mut task_struct) {
+    fn task_free(task: TaskStructRef) {
         return;
     }
 
@@ -84,6 +85,9 @@ impl<T: SecurityHooks> LSMHooks<T> {
     }
 
     pub unsafe extern "C" fn ptrace_access_check(child: *mut task_struct, mode: c_uint) -> c_int {
+        let child = unsafe {
+            TaskStructRef::from_ptr(child)
+        };
         match T::ptrace_access_check(child, mode) {
             Ok(_) => {
                 return 0;
@@ -95,6 +99,9 @@ impl<T: SecurityHooks> LSMHooks<T> {
     }
 
     pub unsafe extern "C" fn ptrace_traceme(parent: *mut task_struct) -> c_int {
+        let parent = unsafe {
+            TaskStructRef::from_ptr(parent)
+        };
         match T::ptrace_traceme(parent) {
             Ok(_) => {
                 return 0;
@@ -106,6 +113,9 @@ impl<T: SecurityHooks> LSMHooks<T> {
     }
 
     pub unsafe extern "C" fn task_free(task: *mut task_struct) {
+        let task = unsafe {
+            TaskStructRef::from_ptr(task)
+        };
         T::task_free(task);
     }
 
@@ -205,4 +215,180 @@ macro_rules! define_lsm {
             blobs: core::ptr::null_mut(),
         };
     };
+}
+
+pub fn with_rcu_read_lock<T, F: FnOnce() -> T> (f: F) -> T {
+    unsafe { rcu_read_lock_exported(); }
+    let ret = f();
+    unsafe { rcu_read_unlock_exported(); }
+    ret
+}
+
+pub unsafe fn rcu_dereference<T> (p: *mut *mut T) -> *mut T {
+    unsafe {
+        rcu_dereference_exported(p as *mut *mut c_void) as *mut T
+    }
+}
+
+pub unsafe fn rcu_dereference_const<T> (p: *const *const T) -> *const T {
+    unsafe {
+        rcu_dereference_exported(p as *mut *mut c_void) as *const T
+    }
+}
+
+// simple abstraction for task_struct
+
+pub struct TaskStructRef {
+    ptr: *mut task_struct,
+    got: bool,
+}
+
+impl TaskStructRef {
+    pub fn from_ptr_get(ptr: *mut task_struct) -> TaskStructRef {
+        unsafe {
+            get_task_struct_exported(ptr);    
+        }
+        return TaskStructRef {
+            ptr,
+            got: true,
+        }
+    }
+
+    // create from pointer without inc ref count
+    // preconditions: ref count does not need incrementing
+    pub unsafe fn from_ptr(ptr: *mut task_struct) -> TaskStructRef {
+        return TaskStructRef {
+            ptr,
+            got: false,
+        }
+    }
+
+    pub fn current() -> TaskStructRef {
+        let current = unsafe { 
+            get_current_exported() 
+        };
+        unsafe {
+            TaskStructRef::from_ptr(current)
+        }
+    }
+
+    pub fn current_get() -> TaskStructRef {
+        let current = unsafe { 
+            get_current_exported() 
+        };
+        TaskStructRef::from_ptr_get(current)
+    }
+
+    pub fn null(&self) -> bool {
+        self.ptr == core::ptr::null_mut()
+    }
+    
+    pub fn get(&mut self) {
+        unsafe {
+            get_task_struct_exported(self.ptr);
+        }
+        self.got = true;
+    }
+
+    pub unsafe fn get_ptr(&self) -> *mut task_struct {
+        self.ptr
+    }
+
+    pub fn got(&self) -> bool {
+        self.got
+    }
+
+    pub fn pid(&self) -> pid_t {
+        unsafe {
+            (*self.ptr).pid
+        }
+    }
+
+    pub fn same_thread_group(&self, other: &TaskStructRef) -> bool {
+        unsafe {
+            (*self.ptr).signal == (*other.ptr).signal
+        }
+    }
+
+    pub fn thread_group_leader(&self) -> bool {
+        unsafe {
+            (*self.ptr).exit_signal >= 0
+        }
+    }
+
+    pub fn pid_alive(&self) -> bool {
+        unsafe {
+            (*self.ptr).thread_pid != core::ptr::null_mut()
+        }
+    }
+
+    // must be in rcu_read_lock context
+    pub unsafe fn get_thread_group_leader(self) -> TaskStructRef {
+        if self.thread_group_leader() {
+            self
+        } else {
+            let ptr_rcu = unsafe {
+                rcu_dereference(&mut (*self.ptr).group_leader as *mut *mut _)
+            };
+            unsafe {
+                TaskStructRef::from_ptr(ptr_rcu)
+            }
+        }
+    }
+
+    // must be in rcu_read_lock context
+    pub unsafe fn get_real_parent(&self) -> TaskStructRef {
+        let parent_ptr = unsafe {
+            rcu_dereference(&mut (*self.ptr).real_parent  as *mut *mut _)
+        };
+        unsafe {
+            TaskStructRef::from_ptr(parent_ptr)
+        }
+    }
+
+    // must be in rcu_read_lock context
+    pub unsafe fn get_ptrace_parent(&self) -> TaskStructRef {
+        let parent_ptr = unsafe {
+            rcu_dereference(&mut (*self.ptr).parent as *mut *mut _)
+        };
+        unsafe {
+            TaskStructRef::from_ptr(parent_ptr)
+        }
+    }
+
+    // must be in rcu_read_lock context
+    pub unsafe fn user_ns_capable(&self, cap: u32) -> bool {
+        let task_cred = unsafe { rcu_dereference_const(&(*self.ptr).real_cred as *const *const cred) };
+        unsafe {
+            ns_capable_exported((*task_cred).user_ns, cap.try_into().unwrap()) >= 0    
+        }
+    }
+}
+
+impl Drop for TaskStructRef {
+    fn drop(&mut self) {
+        unsafe {
+            if self.got {
+                put_task_struct_exported(self.ptr);
+            }
+        }
+    }
+}
+
+impl PartialEq for TaskStructRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr == other.ptr
+    }
+}
+
+impl Clone for TaskStructRef {
+    fn clone(&self) -> TaskStructRef {
+        if self.got {
+            TaskStructRef::from_ptr_get(self.ptr)
+        } else {
+            unsafe {
+                TaskStructRef::from_ptr(self.ptr)
+            }
+        }
+    }
 }
