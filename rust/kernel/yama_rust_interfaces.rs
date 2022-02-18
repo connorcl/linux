@@ -218,19 +218,28 @@ macro_rules! define_lsm {
     };
 }
 
-// struct to represent RCU lock context
-pub struct RCULockContext {
+// ZST struct to represent RCU lock context
+struct RCULockContext {
     // private field prevents direct construction
-    _phantom: PhantomData<()>,
+    _private: (),
 }
 
 impl RCULockContext {
-    pub fn lock() -> RCULockContext {
+    pub(crate) fn lock() -> RCULockContext {
         unsafe {
             rcu_read_lock_exported();
         }
         RCULockContext {
-            _phantom: PhantomData
+            _private: ()
+        }
+    }
+
+    // get a zero-size 'reference' type that behaves as if 
+    // if holds a reference to self, enforcing that this reference
+    // does not outlive self
+    pub(crate) fn get_ref<'a>(&'a self) -> RCULockContextRef<'a> {
+        RCULockContextRef {
+            _phantom: PhantomData,
         }
     }
 }
@@ -243,31 +252,38 @@ impl Drop for RCULockContext {
     }
 }
 
-pub fn with_rcu_read_lock<T, F: FnOnce(&RCULockContext) -> T> (f: F) -> T {
-    let ctx = RCULockContext::lock();
-    f(&ctx)
+// zero-size simulated 'reference' to a valid RCU lock context
+#[derive(Copy, Clone)]
+pub struct RCULockContextRef<'a> {
+    _phantom: PhantomData<&'a RCULockContext>
 }
 
-pub fn rcu_dereference<T> (p: *mut *mut T, _ctx: &RCULockContext) -> *mut T {
+
+pub fn with_rcu_read_lock<T, F: FnOnce(RCULockContextRef<'_>) -> T> (f: F) -> T {
+    let ctx = RCULockContext::lock();
+    f(ctx.get_ref())
+}
+
+pub fn rcu_dereference<T> (p: *mut *mut T, _ctx: RCULockContextRef<'_>) -> *mut T {
     unsafe {
         rcu_dereference_exported(p as *mut *mut c_void) as *mut T
     }
 }
 
-pub fn rcu_dereference_const<T> (p: *const *const T, _ctx: &RCULockContext) -> *const T {
+pub fn rcu_dereference_const<T> (p: *const *const T, _ctx: RCULockContextRef<'_>) -> *const T {
     unsafe {
         rcu_dereference_exported(p as *mut *mut c_void) as *const T
     }
 }
 
-pub fn rcu_assign_pointer<T>(p: *mut *mut T, v: *mut T, _ctx: &RCULockContext) {
+pub fn rcu_assign_pointer<T>(p: *mut *mut T, v: *mut T, _ctx: RCULockContextRef<'_>) {
     unsafe {
         rcu_assign_pointer_exported(p as *mut *mut c_void, v as *mut c_void);
     }
 }
 
 // set callback to free allocated memory
-unsafe fn rcu_free<T: GetRCUHead>(p: *mut T, _ctx: &RCULockContext) {
+unsafe fn rcu_free<T: GetRCUHead>(p: *mut T, _ctx: RCULockContextRef<'_>) {
     if p != core::ptr::null_mut() {
         // get pointer to RCU head
         let rcu_head_ptr = unsafe {
@@ -386,7 +402,7 @@ impl TaskStructRef {
     }
 
     // must be in rcu_read_lock context
-    pub fn get_thread_group_leader(self, ctx: &RCULockContext) -> Option<TaskStructRef> {
+    pub fn get_thread_group_leader(self, ctx: RCULockContextRef<'_>) -> Option<TaskStructRef> {
         if self.thread_group_leader() {
             Some(self)
         } else {
@@ -400,7 +416,7 @@ impl TaskStructRef {
     }
 
     // must be in rcu_read_lock context
-    pub fn get_real_parent(&self, ctx: &RCULockContext) -> Option<TaskStructRef> {
+    pub fn get_real_parent(&self, ctx: RCULockContextRef<'_>) -> Option<TaskStructRef> {
         let parent_ptr = unsafe {
             rcu_dereference(&mut (*self.ptr.as_ptr()).real_parent as *mut *mut _, ctx)
         };
@@ -410,7 +426,7 @@ impl TaskStructRef {
     }
 
     // must be in rcu_read_lock context
-    pub fn get_ptrace_parent(&self, ctx: &RCULockContext) -> Option<TaskStructRef> {
+    pub fn get_ptrace_parent(&self, ctx: RCULockContextRef<'_>) -> Option<TaskStructRef> {
         let parent_ptr = unsafe {
             rcu_dereference(&mut (*self.ptr.as_ptr()).parent as *mut *mut _, ctx)
         };
@@ -420,7 +436,7 @@ impl TaskStructRef {
     }
 
     // must be in rcu_read_lock context
-    pub fn user_ns_capable(&self, cap: u32, ctx: &RCULockContext) -> bool {
+    pub fn user_ns_capable(&self, cap: u32, ctx: RCULockContextRef<'_>) -> bool {
         let task_cred = unsafe {
             rcu_dereference_const(&(*self.ptr.as_ptr()).real_cred as *const *const cred, ctx)
         };
@@ -563,14 +579,14 @@ impl<T> RCULinks<T> {
     }
 
     // rcu-dereference and return the pointer to the next element
-    pub fn rcu_dereference_next(&self, ctx: &RCULockContext) -> *mut T {
+    pub fn rcu_dereference_next(&self, ctx: RCULockContextRef<'_>) -> *mut T {
         let ptr_to_list_entry = unsafe { self.entry.get() };
         let ptr_to_next_ptr = unsafe { &mut (*ptr_to_list_entry).next as *mut *mut T };
         rcu_dereference(ptr_to_next_ptr, ctx)
     }
 
     // atomically assign the given pointer as the pointer to the next element
-    pub fn rcu_assign_next(&self, next: *mut T, ctx: &RCULockContext) {
+    pub fn rcu_assign_next(&self, next: *mut T, ctx: RCULockContextRef<'_>) {
         let ptr_to_list_entry = unsafe { self.entry.get() };
         let ptr_to_next_ptr = unsafe { &mut (*ptr_to_list_entry).next as *mut *mut T };
         rcu_assign_pointer(ptr_to_next_ptr, next, ctx);
@@ -596,14 +612,26 @@ impl<T: RCUGetLinks + GetRCUHead> RCUList<T> {
         }
     }
 
-    pub fn cursor_front_mut_rcu<'a>(&'a mut self, ctx: &RCULockContext) -> RCUListCursorMut<'a, T> {
+    pub fn cursor_front_rcu(&self, ctx: RCULockContextRef<'_>) -> RCUListCursor<T> {
+        RCUListCursor {
+            cur: NonNull::new(rcu_dereference(&self.head as *const *mut T::EntryType as *mut *mut T::EntryType, ctx)),
+        }
+    }
+
+    pub fn cursor_front_mut_rcu(&mut self, ctx: RCULockContextRef<'_>) -> RCUListCursorMut<'_, T> {
         RCUListCursorMut {
             cur: NonNull::new(rcu_dereference(&mut self.head as *mut *mut T::EntryType, ctx)),
             list: self,
         }
     }
 
-    pub fn push_back_rcu(&mut self, new: Box<T::EntryType>, ctx: &RCULockContext) {
+    pub fn cursor_front_inplace_mut_rcu(&self, ctx: RCULockContextRef<'_>) -> RCUListCursorInplaceMut<T> {
+        RCUListCursorInplaceMut {
+            cur: NonNull::new(rcu_dereference(&self.head as *const *mut T::EntryType as *mut *mut T::EntryType, ctx)),
+        }
+    }
+ 
+    pub fn push_back_rcu(&mut self, new: Box<T::EntryType>, ctx: RCULockContextRef<'_>) {
         // get head ptr
         let head = NonNull::new(self.head);
         // convert box to raw pointer to prevent drop
@@ -659,10 +687,30 @@ pub struct RCUListCursor<T: RCUGetLinks + GetRCUHead> {
 impl<T: RCUGetLinks + GetRCUHead> RCUListCursor<T> {
 
     pub fn current(&self) -> Option<&T::EntryType> {
-        Some(unsafe { &*self.cur?.as_ptr()} )
+        Some(unsafe { &*self.cur?.as_ptr() })
     }
 
-    pub fn move_next_rcu(&mut self, ctx: &RCULockContext) {
+    pub fn move_next_rcu(&mut self, ctx: RCULockContextRef<'_>) {
+        if let Some(p) = self.cur {
+            let next_ptr = unsafe {
+                T::get_links(&mut *p.as_ptr()).rcu_dereference_next(ctx)
+            };
+            self.cur = NonNull::new(next_ptr);
+        }
+    }
+}
+
+pub struct RCUListCursorInplaceMut<T: RCUGetLinks + GetRCUHead> {
+    cur: Option<NonNull<T::EntryType>>,
+}
+
+impl<T: RCUGetLinks + GetRCUHead> RCUListCursorInplaceMut<T> {
+
+    pub fn current_mut(&mut self) -> Option<*mut T::EntryType> {
+        Some(unsafe { self.cur?.as_ptr() })
+    }
+
+    pub fn move_next_rcu(&mut self, ctx: RCULockContextRef<'_>) {
         if let Some(p) = self.cur {
             let next_ptr = unsafe {
                 T::get_links(&mut *p.as_ptr()).rcu_dereference_next(ctx)
@@ -674,16 +722,18 @@ impl<T: RCUGetLinks + GetRCUHead> RCUListCursor<T> {
 
 pub struct RCUListCursorMut<'a, T: RCUGetLinks + GetRCUHead> {
     cur: Option<NonNull<T::EntryType>>,
+    // only one of these cursors per list, but can coexist with
+    // regular and inplace (unsafe) cursors
     list: &'a mut RCUList<T>,
 }
 
 impl<T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'_, T> {
 
-    pub fn current(&mut self) -> Option<&mut T::EntryType> {
-        Some(unsafe { &mut *self.cur?.as_ptr()} )
+    pub fn current(&self) -> Option<&T::EntryType> {
+        Some(unsafe { &*self.cur?.as_ptr() })
     }
 
-    pub fn move_next_rcu(&mut self, ctx: &RCULockContext) {
+    pub fn move_next_rcu(&mut self, ctx: RCULockContextRef<'_>) {
         if let Some(p) = self.cur {
             let next_ptr = unsafe {
                 T::get_links(&mut *p.as_ptr()).rcu_dereference_next(ctx)
@@ -692,7 +742,7 @@ impl<T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'_, T> {
         }
     }
 
-    pub fn remove_current_rcu(&mut self, ctx: &RCULockContext) {
+    pub fn remove_current_rcu(&mut self, ctx: RCULockContextRef<'_>) {
         if let Some(p) = self.cur {
             unsafe {
                 // get pointer to current item's list entry
@@ -731,7 +781,7 @@ impl<T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'_, T> {
         }
     }
 
-    pub fn replace_current_rcu(&mut self, new: Box<T::EntryType>, ctx: &RCULockContext) {
+    pub fn replace_current_rcu(&mut self, new: Box<T::EntryType>, ctx: RCULockContextRef<'_>) {
         if let Some(p) = self.cur {
             unsafe {
                 // convert box to raw pointer to prevent drop
