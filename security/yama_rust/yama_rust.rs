@@ -9,7 +9,7 @@ use core::ptr::null_mut;
 use kernel::sync::*;
 use kernel::spinlock_init;
 use kernel::linked_list::*;
-use core::cell::RefCell;
+use core::cell::UnsafeCell;
 
 // LSM name - serves as a unique identifier for this security module
 const __NAME: &[u8] = b"test_rust_lsm\0";
@@ -80,18 +80,105 @@ impl RCUGetLinks for PtraceRelationNode {
 
 }
 
-type PtraceRelationList = RCUList<PtraceRelationNode>;
-type PtraceRelationListContainer = Pin<Box<SpinLock<PtraceRelationList>>>;
+static ptracer_relations: PtraceRelationListOuter = PtraceRelationListOuter::new();
 
-static mut ptracer_relations: Option<PtraceRelationListContainer> = None;
+struct PtraceRelationListOuter {
+    list: UnsafeCell<PtraceRelationList>
+}
 
-fn yama_relation_cleanup() {
-    // mutably borrow spinlock-protected list if present
-    if let Some(ref mut p) = unsafe { &mut ptracer_relations } {
-        // lock spinlock to mutably borrow the inner list
-        let list = &mut *p.lock();
+unsafe impl Sync for PtraceRelationListOuter { }
+
+impl PtraceRelationListOuter {
+    pub(crate) const fn new() -> PtraceRelationListOuter {
+        PtraceRelationListOuter { 
+            list: UnsafeCell::new(PtraceRelationList::Uninitialized), 
+        }
+    }
+
+    // must not be run concurrently with any other methods
+    #[link_section = ".init.text"]
+    pub(crate) unsafe fn init(&self) {
+        let r = unsafe { &mut *self.list.get() };
+
+        if let PtraceRelationList::Uninitialized = r {
+            *r = PtraceRelationList::new_init();
+        }
+    }
+
+    pub(crate) fn if_initialized<R, F: FnOnce(&PtraceRelationListInner) -> R>(&self, f: F) -> Result<R> {
+        // safe assuming init cannot be called concurrently
+        let list = unsafe { &*self.list.get() };
+        if let PtraceRelationList::Initialized { inner } = list {
+            Ok(f(inner))
+        } else {
+            Err(Error::EINVAL)
+        }
+    }
+
+    pub(crate) fn cleanup_relations(&self) {
+        self.if_initialized(|inner| {
+            inner.cleanup_relations();
+        }).unwrap();
+    }
+
+    pub(crate) fn add_relation(&self, relation: PtraceRelation) {
+        self.if_initialized(|inner| {
+            inner.add_relation(relation);
+        }).unwrap();
+    }
+
+    pub(crate) fn del_relation(&self, tracer_task: Option<TaskStructRef>, tracee_task: Option<TaskStructRef>) {
+        self.if_initialized(|inner| {
+            inner.del_relation(tracer_task, tracee_task);
+        }).unwrap();
+    }
+    
+    pub(crate) fn exception_found(&self, tracer_task: TaskStructRef, tracee_task: TaskStructRef) -> bool {
+        self.if_initialized(|inner| {
+            inner.exception_found(tracer_task, tracee_task)
+        }).unwrap()
+    }
+}
+
+enum PtraceRelationList {
+    Initialized { inner: PtraceRelationListInner },
+    Uninitialized,
+}
+
+impl PtraceRelationList {
+    pub(crate) fn new_init() -> PtraceRelationList {
+        let mut list = PtraceRelationList::Initialized {
+            inner: PtraceRelationListInner {
+                list: UnsafeCell::new(RCUList::new()),
+                lock: Pin::from(Box::try_new(unsafe { SpinLock::new(()) }).unwrap()),
+            }
+        };
+        if let PtraceRelationList::Initialized { ref mut inner } = list {
+            spinlock_init!(inner.lock.as_mut(), "a::b::C");
+        }
+        list
+    }
+}
+
+struct PtraceRelationListInner {
+    // list
+    list: UnsafeCell<RCUList<PtraceRelationNode>>,
+    // spinlock synchronizing write access to list
+    lock: Pin<Box<SpinLock<()>>>,
+}
+
+impl PtraceRelationListInner {
+
+    pub(crate) fn cleanup_relations(&self) {
+        // lock spinlock to synchronize mutable access to list
+        let lock = (*self.lock).lock();
+        // get reference to list: safe as lock is held
+        let list = unsafe {
+            &mut *self.list.get()
+        };
+        // enter RCU critical section
         with_rcu_read_lock(|ctx| {
-            // get a cursor pointing to the first element of the list
+            // get a write-enabled cursor pointing to the first element of the list
             let mut cursor = list.cursor_front_mut_rcu(ctx);
             // unwrap each element of the list in turn, moving the cursor along
             while let Some(relation) = cursor.current() {
@@ -107,18 +194,17 @@ fn yama_relation_cleanup() {
             }
         });
     }
-}
 
-fn yama_ptracer_add(relation: PtraceRelation) {
-    // mutably borrow spinlock-protected list if present
-    if let Some(ref mut p) = unsafe { &mut ptracer_relations } {
-        
+    pub(crate) fn add_relation(&self, relation: PtraceRelation) {
+        // lock spinlock to synchronize mutable access to list
+        let lock = (*self.lock).lock();
+        // get reference to list: safe as lock is held
+        let list = unsafe {
+            &mut *self.list.get()
+        };
         // allocate memory for new item
         let new_item = Box::try_new(PtraceRelationNode::new(relation.clone(), false)).unwrap();
-        
-        // lock spinlock to mutably borrow the inner list
-        let list = &mut *p.lock();
-
+        // enter RCU critical section
         with_rcu_read_lock(|ctx| {
             // get a cursor pointing to the first element of the list
             let mut cursor = list.cursor_front_mut_rcu(ctx);
@@ -139,37 +225,47 @@ fn yama_ptracer_add(relation: PtraceRelation) {
             list.push_back_rcu(new_item, ctx);
         });
     }
-}
 
-fn yama_ptracer_del(tracer_task: Option<TaskStructRef>, tracee_task: Option<TaskStructRef>) {
-    // mutably borrow spinlock-protected list if present
-    if let Some(ref mut p) = unsafe { &mut ptracer_relations } {
-        // lock spinlock to mutably borrow the inner list
-        let list = &mut *p.lock();
-        
+    pub(crate) fn del_relation(&self, tracer_task: Option<TaskStructRef>, tracee_task: Option<TaskStructRef>) {
+        // get reference to list: safe as accesses are safe
+        // even with concurrent mutable access to list
+        let list = unsafe {
+            &mut *self.list.get()
+        };
+        // enter RCU critical section
         with_rcu_read_lock(|ctx| {
-            // get a cursor pointing to the first element of the list
-            let mut cursor = list.cursor_front_mut_rcu(ctx);
+            // get a cursor pointing to the first element of the list,
+            // safe as write accesses (setting invalid) are safe - 
+            // worst case invalid is set for an old item
+            // which is then removed
+            let mut cursor = list.cursor_front_inplace_mut_rcu(ctx);
             // let mut count = 0;
             // unwrap each element of the list in turn, moving the cursor along
-            while let Some(relation_node) = cursor.current() {
+            while let Some(relation_node_ptr) = cursor.current_mut() {
                 // count = count + 1;
-                if !relation_node.invalid {
-                    // obs - help consider borrowing here - move during loop
+                // SAFETY: read access
+                if unsafe { !(*relation_node_ptr).invalid } {
                     if let Some(t) = &tracer_task {
-                        // obs - help consider borrowing here
-                        if let PtraceRelation::TracerTracee { tracer, tracee } = &relation_node.relation {
+                        // SAFETY: read access
+                        if let PtraceRelation::TracerTracee { tracer, tracee } = unsafe { &(*relation_node_ptr).relation } {
                             if *t == *tracer {
                                 pr_info!("Found match, marking relationship as invalid!\n");
-                                relation_node.invalid = true;
+                                // SAFETY: updating invalid is safe, see above
+                                unsafe {
+                                    (*relation_node_ptr).invalid = true;
+                                }
                             }
                         }
                     }
                     // obs - help consider borrowing here - move during loop
                     if let Some(t) = &tracee_task {
-                        if *t == relation_node.relation.get_tracee() {
+                        // SFAETY: read access
+                        if *t == unsafe { (*relation_node_ptr).relation.get_tracee() } {
                             pr_info!("Found match, marking relationship as invalid!\n");
-                            relation_node.invalid = true;
+                            // SAFETY: updating invalid is safe, see above
+                            unsafe { 
+                                (*relation_node_ptr).invalid = true;
+                            }
                         }
                     }
                 }
@@ -177,9 +273,60 @@ fn yama_ptracer_del(tracer_task: Option<TaskStructRef>, tracee_task: Option<Task
             }
             // pr_info!("Relationships: {}\n", count);
         });
+
+        self.cleanup_relations();
     }
 
-    yama_relation_cleanup();
+    pub(crate) fn exception_found(&self, tracer_task: TaskStructRef, tracee_task: TaskStructRef) -> bool {
+        with_rcu_read_lock(|ctx| {
+            let mut found = false;
+            let mut tracee_task = tracee_task;
+            let mut parent = tracee_task.get_ptrace_parent(ctx).unwrap();
+            if !parent.null() && parent.same_thread_group(&tracer_task) {
+                pr_info!("Parent: {}, tracer: {}\n", parent.pid(), parent.pid());
+                pr_info!("Existing trace relationship!\n");
+                return true;
+            }
+    
+            tracee_task = tracee_task.get_thread_group_leader(ctx).unwrap();
+    
+            // obs - more elegant than bool, null pointer
+            let mut relation: Option<PtraceRelation> = None;
+    
+            // get reference to list: safe as accesses will be read only RCU
+            let list = unsafe {
+                &mut *self.list.get()
+            };
+
+            // get a cursor pointing to the first element of the list
+            let mut cursor = list.cursor_front_rcu(ctx);
+            // unwrap each element of the list in turn, moving the cursor along
+            while let Some(relation_node) = cursor.current() {
+                if !relation_node.invalid {
+                    if relation_node.relation.get_tracee() == tracee_task {
+                        relation = Some(relation_node.relation.clone());
+                        break;
+                    }
+                }
+                cursor.move_next_rcu(ctx);
+            }
+    
+            if let Some(r) = relation {
+                match r {
+                    PtraceRelation::AnyTracer { tracee } => {
+                        return true;
+                    },
+                    PtraceRelation::TracerTracee { tracer, tracee } => {
+                        if task_is_descendant(tracer, tracer_task) {
+                            return true;
+                        }
+                    }
+                }
+            }
+    
+            return false;
+        })
+    }
 }
 
 fn task_is_descendant(parent: TaskStructRef, child: TaskStructRef) -> bool {
@@ -202,58 +349,6 @@ fn task_is_descendant(parent: TaskStructRef, child: TaskStructRef) -> bool {
     });
     
     ret
-}
-
-fn ptracer_exception_found(tracer_task: TaskStructRef, tracee_task: TaskStructRef) -> bool {
-    with_rcu_read_lock(|ctx| {
-        let mut found = false;
-        let mut tracee_task = tracee_task;
-        let mut parent = tracee_task.get_ptrace_parent(ctx).unwrap();
-        if !parent.null() && parent.same_thread_group(&tracer_task) {
-            pr_info!("Parent: {}, tracer: {}\n", parent.pid(), parent.pid());
-            pr_info!("Existing trace relationship!\n");
-            return true;
-        }
-
-        tracee_task = tracee_task.get_thread_group_leader(ctx).unwrap();
-
-        // obs - more elegant than bool, null pointer
-        let mut relation: Option<PtraceRelation> = None;
-
-        // mutably borrow spinlock-protected list if present
-        if let Some(ref mut p) = unsafe { &mut ptracer_relations } {
-            // lock spinlock to mutably borrow the inner list
-            let list = &mut *p.lock();
-
-            // get a cursor pointing to the first element of the list
-            let mut cursor = list.cursor_front_mut_rcu(ctx);
-            // unwrap each element of the list in turn, moving the cursor along
-            while let Some(relation_node) = cursor.current() {
-                if !relation_node.invalid {
-                    if relation_node.relation.get_tracee() == tracee_task {
-                        relation = Some(relation_node.relation.clone());
-                        break;
-                    }
-                }
-                cursor.move_next_rcu(ctx);
-            }
-        }
-
-        if let Some(r) = relation {
-            match r {
-                PtraceRelation::AnyTracer { tracee } => {
-                    return true;
-                },
-                PtraceRelation::TracerTracee { tracer, tracee } => {
-                    if task_is_descendant(tracer, tracer_task) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        return false;
-    })
 }
 
 struct TestRustLSM;
@@ -280,7 +375,7 @@ impl SecurityHooks for TestRustLSM {
                         let is_descendant =
                             task_is_descendant(TaskStructRef::current().unwrap(), child.clone());
                         let exception_found = 
-                            ptracer_exception_found(TaskStructRef::current().unwrap(), child.clone());
+                            ptracer_relations.exception_found(TaskStructRef::current().unwrap(), child.clone());
                         let has_capability = child.user_ns_capable(CAP_SYS_PTRACE, ctx);
                         pr_info!("Alive: {}, Capability: {}, Is Descendant: {}, Exception: {}\n", child_alive, has_capability, is_descendant, exception_found);
                         if child_alive && !is_descendant && !exception_found && !has_capability {
@@ -339,7 +434,7 @@ impl SecurityHooks for TestRustLSM {
     }
 
     fn task_free(task: TaskStructRef) {
-        yama_ptracer_del(Some(task.clone()), Some(task.clone()));
+        ptracer_relations.del_relation(Some(task.clone()), Some(task.clone()));
     }
 
     fn task_prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) -> Result {
@@ -355,11 +450,11 @@ impl SecurityHooks for TestRustLSM {
             // no tracing permitted
             if arg2 == 0 {
                 pr_info!("Removing tracee relationship!\n");
-                yama_ptracer_del(None, Some(myself));
+                ptracer_relations.del_relation(None, Some(myself));
                 ret = Ok(());
             } else if arg2 as i32 == -1 {
                 pr_info!("Adding tracee relationship: any tracer!\n");
-                yama_ptracer_add(PtraceRelation::AnyTracer {
+                ptracer_relations.add_relation(PtraceRelation::AnyTracer {
                     tracee: myself,
                 });
             } else {
@@ -373,7 +468,7 @@ impl SecurityHooks for TestRustLSM {
                     let tracer = unsafe {
                         TaskStructRef::from_ptr(tracer).unwrap()
                     };
-                    yama_ptracer_add(PtraceRelation::TracerTracee {
+                    ptracer_relations.add_relation(PtraceRelation::TracerTracee {
                         tracer: tracer,
                         tracee: myself,
                     });
@@ -391,15 +486,10 @@ impl SecurityModule for TestRustLSM {
     fn init(hooks: &mut SecurityHookList) -> Result {
         pr_info!("Successfully initialized simple Rust LSM!\n");
 
-        // initialize the global, spinlock-protected list of ptracer relations
-        // SAFETY: this should be the only place the variable itself is mutated
-        // and nothing else will be accessing it as no hooks have been registered
+        // SAFETY: no other methods will be getting called as
+        // hooks are not yet registered
         unsafe {
-            ptracer_relations = Some(Pin::from(Box::try_new(SpinLock::new(RCUList::new()))?));
-            if let Some(ref mut p) = &mut ptracer_relations {
-                let a = &mut *p.lock();
-                // pr_info!("Empty: {}\n", a.is_empty());
-            }
+            ptracer_relations.init();
         }
 
         // SAFETY: register is being called during init, 
