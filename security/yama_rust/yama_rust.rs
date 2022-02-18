@@ -51,6 +51,7 @@ struct PtraceRelationNode {
 
 impl PtraceRelationNode {
     pub(crate) fn new(relation: PtraceRelation, invalid: bool) -> PtraceRelationNode {
+        
         return PtraceRelationNode {
             relation,
             rcu_head: callback_head {
@@ -65,9 +66,7 @@ impl PtraceRelationNode {
 
 impl GetRCUHead for PtraceRelationNode {
     fn get_rcu_head(&self) -> *mut callback_head {
-        unsafe {
-            &self.rcu_head as *const _ as *mut _
-        }
+        &self.rcu_head as *const _ as *mut _
     }
 }
 
@@ -91,11 +90,9 @@ fn yama_relation_cleanup() {
     if let Some(ref mut p) = unsafe { &mut ptracer_relations } {
         // lock spinlock to mutably borrow the inner list
         let list = &mut *p.lock();
-        with_rcu_read_lock(|| {
+        with_rcu_read_lock(|ctx| {
             // get a cursor pointing to the first element of the list
-            let mut cursor = unsafe {
-                list.cursor_front_mut_rcu()
-            };
+            let mut cursor = list.cursor_front_mut_rcu(ctx);
             // unwrap each element of the list in turn, moving the cursor along
             while let Some(relation) = cursor.current() {
                 // check if the relation is invalid and remove if so
@@ -103,13 +100,9 @@ fn yama_relation_cleanup() {
                     // this returns a Box, meaning the underlying element is deallocated
                     // once the Box goes out of scope
                     pr_info!("Removing invalid relationship!\n");
-                    unsafe {
-                        cursor.remove_current_rcu()
-                    }
+                    cursor.remove_current_rcu(ctx)
                 } else {
-                    unsafe {
-                        cursor.move_next_rcu();
-                    }
+                    cursor.move_next_rcu(ctx);
                 }
             }
         });
@@ -126,30 +119,24 @@ fn yama_ptracer_add(relation: PtraceRelation) {
         // lock spinlock to mutably borrow the inner list
         let list = &mut *p.lock();
 
-        with_rcu_read_lock(|| {
+        with_rcu_read_lock(|ctx| {
             // get a cursor pointing to the first element of the list
-            let mut cursor = unsafe {
-                list.cursor_front_mut_rcu()
-            };
+            let mut cursor = list.cursor_front_mut_rcu(ctx);
             // unwrap each element of the list in turn, moving the cursor along
             while let Some(relation_node) = cursor.current() {
                 if !relation_node.invalid {
                     // update tracer if an existing relationship is present
                     if relation_node.relation.get_tracee() == relation.get_tracee() {
                         pr_info!("Replacing relationship!\n");
-                        unsafe {
-                            cursor.replace_current_rcu(new_item);
-                        }
+                        cursor.replace_current_rcu(new_item, ctx);
                         return;
                     }
                 }
-                unsafe {
-                    cursor.move_next_rcu();
-                }
+                cursor.move_next_rcu(ctx);
             }
             pr_info!("Adding new relationship!\n");
             // if an existing relationship wasn't found, add a new one
-            list.push_back(new_item);
+            list.push_back_rcu(new_item, ctx);
         });
     }
 }
@@ -160,11 +147,9 @@ fn yama_ptracer_del(tracer_task: Option<TaskStructRef>, tracee_task: Option<Task
         // lock spinlock to mutably borrow the inner list
         let list = &mut *p.lock();
         
-        with_rcu_read_lock(|| {
+        with_rcu_read_lock(|ctx| {
             // get a cursor pointing to the first element of the list
-            let mut cursor = unsafe {
-                list.cursor_front_mut_rcu()
-            };
+            let mut cursor = list.cursor_front_mut_rcu(ctx);
             // let mut count = 0;
             // unwrap each element of the list in turn, moving the cursor along
             while let Some(relation_node) = cursor.current() {
@@ -188,9 +173,7 @@ fn yama_ptracer_del(tracer_task: Option<TaskStructRef>, tracee_task: Option<Task
                         }
                     }
                 }
-                unsafe {
-                    cursor.move_next_rcu();
-                }
+                cursor.move_next_rcu(ctx);
             }
             // pr_info!("Relationships: {}\n", count);
         });
@@ -203,24 +186,18 @@ fn task_is_descendant(parent: TaskStructRef, child: TaskStructRef) -> bool {
 
     let mut ret = false;
 
-    with_rcu_read_lock(|| {
+    with_rcu_read_lock(|ctx| {
 
-        let mut parent = unsafe {
-            parent.get_thread_group_leader().unwrap()
-        };
+        let mut parent = parent.get_thread_group_leader(ctx).unwrap();
         let mut walker = child;
 
         while walker.pid() > 0 {
-            walker = unsafe {
-                walker.get_thread_group_leader().unwrap()
-            };
+            walker = walker.get_thread_group_leader(ctx).unwrap();
             if walker == parent {
                 ret = true;
                 break;
             }
-            walker = unsafe {
-                walker.get_real_parent().unwrap()
-            };
+            walker = walker.get_real_parent(ctx).unwrap();
         }
     });
     
@@ -228,21 +205,17 @@ fn task_is_descendant(parent: TaskStructRef, child: TaskStructRef) -> bool {
 }
 
 fn ptracer_exception_found(tracer_task: TaskStructRef, tracee_task: TaskStructRef) -> bool {
-    with_rcu_read_lock(|| {
+    with_rcu_read_lock(|ctx| {
         let mut found = false;
         let mut tracee_task = tracee_task;
-        let mut parent = unsafe {
-            tracee_task.get_ptrace_parent().unwrap()
-        };
+        let mut parent = tracee_task.get_ptrace_parent(ctx).unwrap();
         if !parent.null() && parent.same_thread_group(&tracer_task) {
             pr_info!("Parent: {}, tracer: {}\n", parent.pid(), parent.pid());
             pr_info!("Existing trace relationship!\n");
             return true;
         }
 
-        tracee_task = unsafe { 
-            tracee_task.get_thread_group_leader().unwrap()
-        };
+        tracee_task = tracee_task.get_thread_group_leader(ctx).unwrap();
 
         // obs - more elegant than bool, null pointer
         let mut relation: Option<PtraceRelation> = None;
@@ -252,24 +225,18 @@ fn ptracer_exception_found(tracer_task: TaskStructRef, tracee_task: TaskStructRe
             // lock spinlock to mutably borrow the inner list
             let list = &mut *p.lock();
 
-            with_rcu_read_lock(|| {
-                // get a cursor pointing to the first element of the list
-                let mut cursor = unsafe {
-                    list.cursor_front_mut_rcu()
-                };
-                // unwrap each element of the list in turn, moving the cursor along
-                while let Some(relation_node) = cursor.current() {
-                    if !relation_node.invalid {
-                        if relation_node.relation.get_tracee() == tracee_task {
-                            relation = Some(relation_node.relation.clone());
-                            break;
-                        }
-                    }
-                    unsafe {
-                        cursor.move_next_rcu();
+            // get a cursor pointing to the first element of the list
+            let mut cursor = list.cursor_front_mut_rcu(ctx);
+            // unwrap each element of the list in turn, moving the cursor along
+            while let Some(relation_node) = cursor.current() {
+                if !relation_node.invalid {
+                    if relation_node.relation.get_tracee() == tracee_task {
+                        relation = Some(relation_node.relation.clone());
+                        break;
                     }
                 }
-            });
+                cursor.move_next_rcu(ctx);
+            }
         }
 
         if let Some(r) = relation {
@@ -308,15 +275,13 @@ impl SecurityHooks for TestRustLSM {
                     ret = Ok(());
                 },
                 YAMA_RUST_SCOPE_RELATIONAL => {
-                    ret = with_rcu_read_lock(|| {
+                    ret = with_rcu_read_lock(|ctx| {
                         let child_alive = child.pid_alive();
                         let is_descendant =
                             task_is_descendant(TaskStructRef::current().unwrap(), child.clone());
                         let exception_found = 
                             ptracer_exception_found(TaskStructRef::current().unwrap(), child.clone());
-                        let has_capability = unsafe {
-                            child.user_ns_capable(CAP_SYS_PTRACE)
-                        };
+                        let has_capability = child.user_ns_capable(CAP_SYS_PTRACE, ctx);
                         pr_info!("Alive: {}, Capability: {}, Is Descendant: {}, Exception: {}\n", child_alive, has_capability, is_descendant, exception_found);
                         if child_alive && !is_descendant && !exception_found && !has_capability {
                             pr_info!("Denied!\n");
@@ -324,20 +289,18 @@ impl SecurityHooks for TestRustLSM {
                         } else {
                             Ok(())
                         }
-                    })
+                    });
                 },
                 YAMA_RUST_SCOPE_CAPABILITY => {
-                    ret = with_rcu_read_lock(|| {
-                        let has_capability = unsafe {
-                            child.user_ns_capable(CAP_SYS_PTRACE)
-                        };
+                    ret = with_rcu_read_lock(|ctx| {
+                        let has_capability = child.user_ns_capable(CAP_SYS_PTRACE, ctx);
                         if !has_capability {
                             pr_info!("Denied!\n");
                             Err(Error::EPERM)
                         } else {
                             Ok(())
                         }
-                    })
+                    });
                 },
                 YAMA_RUST_SCOPE_NO_ATTACH => {
                     pr_info!("Denied!\n");
@@ -385,10 +348,8 @@ impl SecurityHooks for TestRustLSM {
 
         if option == PR_SET_PTRACER as c_int {
 
-            let mut myself = with_rcu_read_lock(|| {
-                unsafe {
-                    TaskStructRef::current_get().unwrap().get_thread_group_leader().unwrap()
-                }
+            let mut myself = with_rcu_read_lock(|ctx| {
+                TaskStructRef::current_get().unwrap().get_thread_group_leader(ctx).unwrap()
             });
 
             // no tracing permitted
