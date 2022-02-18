@@ -36,6 +36,9 @@
 #include <linux/prctl.h>
 #include <uapi/linux/prctl.h>
 #include <linux/sched/signal.h>
+#include <linux/workqueue.h>
+#include <linux/task_work.h>
+#include <linux/sysctl.h>
 
 // `bindgen` gets confused at certain things
 const gfp_t BINDINGS_GFP_KERNEL = GFP_KERNEL;

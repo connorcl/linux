@@ -54,3 +54,7 @@ bool same_thread_group_exported(struct task_struct *p1, struct task_struct *p2) 
 struct user_namespace *current_user_ns_exported(void) {
     return current_user_ns();
 }
+
+bool schedule_work_exported(struct work_struct *work) {
+    return schedule_work(work);
+}

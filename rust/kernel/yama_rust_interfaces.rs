@@ -3,7 +3,7 @@ use crate::bindings::*;
 use crate::c_types::*;
 use crate::error::Error;
 use crate::str::CStr;
-use core::marker::PhantomData;
+use core::marker::{PhantomData, PhantomPinned};
 use alloc::boxed::Box;
 use core::convert::TryInto;
 use core::ptr::NonNull;
@@ -12,6 +12,11 @@ use core::cell::UnsafeCell;
 pub struct SecurityHookList {
     lsm_name: &'static CStr,
     hook_list: &'static mut [security_hook_list],
+}
+
+pub struct SecurityHookList2<const N: usize> {
+    lsm_name: &'static CStr,
+    hook_list: [security_hook_list; N],
 }
 
 impl SecurityHookList {
@@ -823,6 +828,72 @@ impl<T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'_, T> {
                 // queue old item for deallocation
                 rcu_free(p.as_ptr(), ctx);
             }
+        }
+    }
+}
+
+// static mut yama_relation_work: work_struct = work_struct {
+//     data: atomic_long_t {
+//         counter: (WORK_STRUCT_NO_POOL | WORK_STRUCT_STATIC),
+//     },
+//     entry: list_head {
+//         next: unsafe { &yama_relation_work.entry as *const _ as *mut _ },
+//         prev: unsafe { &yama_relation_work.entry as *const _ as *mut _ },
+//     },
+//     func: Some(yama_relation_cleanup),
+// };
+
+// unsafe extern "C" fn yama_relation_cleanup(work: *mut work_struct) {
+//     pr_info!("Relation cleanup from work queue!\n");
+//     ptracer_relations.cleanup_relations();
+// }
+
+pub trait WorkFunc {
+    fn work_func(work: *mut work_struct);
+}
+
+struct WorkFuncCInterface<T: WorkFunc> {
+    _marker: PhantomData<T>,
+}
+
+impl<T: WorkFunc> WorkFuncCInterface<T> {
+    pub(crate) unsafe extern "C" fn work_func(work: *mut work_struct) {
+        T::work_func(work);
+    }
+}
+
+pub struct WorkStruct<T: WorkFunc> {
+    work: work_struct,
+    _marker: PhantomData<T>,
+    _pin: PhantomPinned,
+}
+
+impl<T: WorkFunc> WorkStruct<T> {
+    pub fn new() -> WorkStruct<T> {
+        let mut a = WorkStruct {
+            work: work_struct {
+                data: atomic_long_t {
+                    counter: (WORK_STRUCT_NO_POOL | WORK_STRUCT_STATIC),
+                },
+                entry: list_head {
+                    next: core::ptr::null_mut(),
+                    prev: core::ptr::null_mut(),
+                },
+                func: Some(WorkFuncCInterface::<T>::work_func),
+            },
+            _marker: PhantomData,
+            _pin: PhantomPinned,
+        };
+        a.work.entry.next = &a.work.entry as *const _ as *mut _;
+        a.work.entry.prev = &a.work.entry as *const _ as *mut _;
+        return a;
+    }
+
+    pub fn schedule(&'static self) {
+        // self.work.entry.next = &self.work.entry as *const _ as *mut _;
+        // self.work.entry.prev = &self.work.entry as *const _ as *mut _;
+        unsafe {
+            schedule_work_exported(&self as *const _ as *mut _);
         }
     }
 }
