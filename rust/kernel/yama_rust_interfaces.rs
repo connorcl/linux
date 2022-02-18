@@ -6,6 +6,8 @@ use crate::str::CStr;
 use core::marker::PhantomData;
 use alloc::boxed::Box;
 use core::convert::TryInto;
+use core::ptr::NonNull;
+use core::cell::UnsafeCell;
 
 
 pub struct SecurityHookList {
@@ -86,7 +88,7 @@ impl<T: SecurityHooks> LSMHooks<T> {
 
     pub unsafe extern "C" fn ptrace_access_check(child: *mut task_struct, mode: c_uint) -> c_int {
         let child = unsafe {
-            TaskStructRef::from_ptr(child)
+            TaskStructRef::from_ptr(child).unwrap()
         };
         match T::ptrace_access_check(child, mode) {
             Ok(_) => {
@@ -100,7 +102,7 @@ impl<T: SecurityHooks> LSMHooks<T> {
 
     pub unsafe extern "C" fn ptrace_traceme(parent: *mut task_struct) -> c_int {
         let parent = unsafe {
-            TaskStructRef::from_ptr(parent)
+            TaskStructRef::from_ptr(parent).unwrap()
         };
         match T::ptrace_traceme(parent) {
             Ok(_) => {
@@ -114,7 +116,7 @@ impl<T: SecurityHooks> LSMHooks<T> {
 
     pub unsafe extern "C" fn task_free(task: *mut task_struct) {
         let task = unsafe {
-            TaskStructRef::from_ptr(task)
+            TaskStructRef::from_ptr(task).unwrap()
         };
         T::task_free(task);
     }
@@ -236,34 +238,73 @@ pub unsafe fn rcu_dereference_const<T> (p: *const *const T) -> *const T {
     }
 }
 
-// simple abstraction for task_struct
+pub unsafe fn rcu_assign_pointer<T>(p: *mut *mut T, v: *mut T) {
+    unsafe {
+        rcu_assign_pointer_exported(p as *mut *mut c_void, v as *mut c_void);
+    }
+}
 
+// set callback to free allocated memory
+unsafe fn rcu_free<T: GetRCUHead>(p: *mut T) {
+    if p != core::ptr::null_mut() {
+        // get pointer to RCU head
+        let rcu_head_ptr = unsafe {
+            (*p).get_rcu_head()
+        };
+        // get offset of RCU head
+        let rcu_head_offset = (rcu_head_ptr as u64) - (p as u64);
+        // convert offset to function pointer type as required by C interface
+        let callback: rcu_callback_t = unsafe {
+            Some(core::mem::transmute(rcu_head_offset))
+        };
+        unsafe {
+            // set callback to free memory
+            call_rcu(rcu_head_ptr, callback);
+        }
+    }
+}
+
+// simple abstraction for task_struct
 pub struct TaskStructRef {
-    ptr: *mut task_struct,
+    ptr: NonNull<task_struct>,
     got: bool,
 }
 
 impl TaskStructRef {
-    pub fn from_ptr_get(ptr: *mut task_struct) -> TaskStructRef {
-        unsafe {
-            get_task_struct_exported(ptr);    
-        }
-        return TaskStructRef {
-            ptr,
-            got: true,
+    pub fn from_ptr_get(ptr: *mut task_struct) -> Option<TaskStructRef> {
+
+        let ptr = NonNull::new(ptr);
+
+        if let Some(p) = ptr {
+            unsafe {
+                get_task_struct_exported(p.as_ptr());
+            }
+            Some(TaskStructRef {
+                ptr: p,
+                got: true,
+            })
+        } else {
+            None
         }
     }
 
     // create from pointer without inc ref count
     // preconditions: ref count does not need incrementing
-    pub unsafe fn from_ptr(ptr: *mut task_struct) -> TaskStructRef {
-        return TaskStructRef {
-            ptr,
-            got: false,
+    pub unsafe fn from_ptr(ptr: *mut task_struct) -> Option<TaskStructRef> {
+        
+        let ptr = NonNull::new(ptr);
+
+        if let Some(p) = ptr {
+            Some(TaskStructRef {
+                ptr: p,
+                got: false,
+            })
+        } else {
+            None
         }
     }
 
-    pub fn current() -> TaskStructRef {
+    pub fn current() -> Option<TaskStructRef> {
         let current = unsafe { 
             get_current_exported() 
         };
@@ -272,7 +313,7 @@ impl TaskStructRef {
         }
     }
 
-    pub fn current_get() -> TaskStructRef {
+    pub fn current_get() -> Option<TaskStructRef> {
         let current = unsafe { 
             get_current_exported() 
         };
@@ -280,17 +321,17 @@ impl TaskStructRef {
     }
 
     pub fn null(&self) -> bool {
-        self.ptr == core::ptr::null_mut()
+        return false
     }
     
     pub fn get(&mut self) {
         unsafe {
-            get_task_struct_exported(self.ptr);
+            get_task_struct_exported(self.ptr.as_ptr());
         }
         self.got = true;
     }
 
-    pub unsafe fn get_ptr(&self) -> *mut task_struct {
+    pub unsafe fn get_ptr(&self) -> NonNull<task_struct> {
         self.ptr
     }
 
@@ -300,35 +341,35 @@ impl TaskStructRef {
 
     pub fn pid(&self) -> pid_t {
         unsafe {
-            (*self.ptr).pid
+            (*self.ptr.as_ptr()).pid
         }
     }
 
     pub fn same_thread_group(&self, other: &TaskStructRef) -> bool {
         unsafe {
-            (*self.ptr).signal == (*other.ptr).signal
+            (*self.ptr.as_ptr()).signal == (*other.ptr.as_ptr()).signal
         }
     }
 
     pub fn thread_group_leader(&self) -> bool {
         unsafe {
-            (*self.ptr).exit_signal >= 0
+            (*self.ptr.as_ptr()).exit_signal >= 0
         }
     }
 
     pub fn pid_alive(&self) -> bool {
         unsafe {
-            (*self.ptr).thread_pid != core::ptr::null_mut()
+            (*self.ptr.as_ptr()).thread_pid != core::ptr::null_mut()
         }
     }
 
     // must be in rcu_read_lock context
-    pub unsafe fn get_thread_group_leader(self) -> TaskStructRef {
+    pub unsafe fn get_thread_group_leader(self) -> Option<TaskStructRef> {
         if self.thread_group_leader() {
-            self
+            Some(self)
         } else {
             let ptr_rcu = unsafe {
-                rcu_dereference(&mut (*self.ptr).group_leader as *mut *mut _)
+                rcu_dereference(&mut (*self.ptr.as_ptr()).group_leader as *mut *mut _)
             };
             unsafe {
                 TaskStructRef::from_ptr(ptr_rcu)
@@ -337,9 +378,9 @@ impl TaskStructRef {
     }
 
     // must be in rcu_read_lock context
-    pub unsafe fn get_real_parent(&self) -> TaskStructRef {
+    pub unsafe fn get_real_parent(&self) -> Option<TaskStructRef> {
         let parent_ptr = unsafe {
-            rcu_dereference(&mut (*self.ptr).real_parent  as *mut *mut _)
+            rcu_dereference(&mut (*self.ptr.as_ptr()).real_parent as *mut *mut _)
         };
         unsafe {
             TaskStructRef::from_ptr(parent_ptr)
@@ -347,9 +388,9 @@ impl TaskStructRef {
     }
 
     // must be in rcu_read_lock context
-    pub unsafe fn get_ptrace_parent(&self) -> TaskStructRef {
+    pub unsafe fn get_ptrace_parent(&self) -> Option<TaskStructRef> {
         let parent_ptr = unsafe {
-            rcu_dereference(&mut (*self.ptr).parent as *mut *mut _)
+            rcu_dereference(&mut (*self.ptr.as_ptr()).parent as *mut *mut _)
         };
         unsafe {
             TaskStructRef::from_ptr(parent_ptr)
@@ -358,7 +399,7 @@ impl TaskStructRef {
 
     // must be in rcu_read_lock context
     pub unsafe fn user_ns_capable(&self, cap: u32) -> bool {
-        let task_cred = unsafe { rcu_dereference_const(&(*self.ptr).real_cred as *const *const cred) };
+        let task_cred = unsafe { rcu_dereference_const(&(*self.ptr.as_ptr()).real_cred as *const *const cred) };
         unsafe {
             ns_capable_exported((*task_cred).user_ns, cap.try_into().unwrap()) >= 0    
         }
@@ -369,7 +410,7 @@ impl Drop for TaskStructRef {
     fn drop(&mut self) {
         unsafe {
             if self.got {
-                put_task_struct_exported(self.ptr);
+                put_task_struct_exported(self.ptr.as_ptr());
             }
         }
     }
@@ -384,10 +425,317 @@ impl PartialEq for TaskStructRef {
 impl Clone for TaskStructRef {
     fn clone(&self) -> TaskStructRef {
         if self.got {
-            TaskStructRef::from_ptr_get(self.ptr)
+            TaskStructRef::from_ptr_get(self.ptr.as_ptr()).unwrap()
         } else {
             unsafe {
-                TaskStructRef::from_ptr(self.ptr)
+                TaskStructRef::from_ptr(self.ptr.as_ptr()).unwrap()
+            }
+        }
+    }
+}
+
+
+// trait for getting an RCU head field from a struct 
+pub trait GetRCUHead {
+    fn get_rcu_head(&self) -> *mut callback_head;
+}
+
+// RCU smart pointer type
+struct RCUPtr<T: GetRCUHead> {
+    ptr: *mut T,
+}
+
+impl<T: GetRCUHead> RCUPtr<T> {
+
+    // allocate new memory
+    pub(crate) fn new() -> Option<RCUPtr<T>> {
+        // get size of type T
+        let size = core::mem::size_of::<T>();
+        // attempt to allocate memory of required size
+        let ptr = unsafe {
+            krealloc(core::ptr::null(), size, GFP_KERNEL) as *mut T
+        };
+        if ptr == core::ptr::null_mut() {
+            None
+        } else {
+            Some(RCUPtr { ptr })
+        }
+    }
+
+    // convert to raw pointer
+    pub(crate) fn into_raw(mut ptr: RCUPtr<T>) -> *mut T {
+        // get pointer
+        let inner_ptr = ptr.ptr;
+        // set other ptr to null to prevent memory being freed on drop
+        ptr.ptr = core::ptr::null_mut();
+        // return ptr
+        inner_ptr
+    }
+
+    pub(crate) unsafe fn from_raw(ptr: *mut T) -> Option<RCUPtr<T>> {
+        if ptr == core::ptr::null_mut() {
+            None
+        } else {
+            Some(RCUPtr { ptr })
+        }
+    }
+
+    // rcu-dereference and return the stored pointer
+    pub(crate) unsafe fn rcu_dereference(&self) -> Option<NonNull<T>> {
+        unsafe {
+            NonNull::new(rcu_dereference(&self.ptr as *const *mut T as *mut *mut T))
+        }
+    }
+
+    // update this pointer from another RCU pointer,
+    // freeing the memory currently referenced
+    // and consuming the passed pointer object
+    pub(crate) unsafe fn rcu_assign(&mut self, mut other: RCUPtr<T>) {
+        // remember old pointer for freeing
+        let old_ptr = self.ptr;
+        // atomically update current pointer
+        unsafe {
+            rcu_assign_pointer(
+                &mut self.ptr as *mut *mut T,
+                other.ptr,
+            )
+        }
+        // set other ptr to null to prevent memory being freed on drop:
+        // that memory is now managed by this object
+        other.ptr = core::ptr::null_mut();
+        // free memory referenced by old pointer
+        unsafe {
+            rcu_free(old_ptr);
+        }
+    }
+}
+
+impl<T: GetRCUHead> Drop for RCUPtr<T> {
+    fn drop(&mut self) {
+        unsafe {
+            rcu_free(self.ptr);
+        }
+    }
+}
+
+pub struct RCUListEntry<T> {
+    next: *mut T,
+    prev: *mut T,
+}
+
+pub struct RCULinks<T> {
+    entry: UnsafeCell<RCUListEntry<T>>
+}
+
+impl<T> RCULinks<T> {
+
+    // rcu-dereference and return the pointer to the next element
+    pub unsafe fn rcu_dereference_next(&self) -> *mut T {
+        unsafe {
+            let ptr_to_list_entry = self.entry.get();
+            let ptr_to_next_ptr = &mut (*ptr_to_list_entry).next as *mut *mut T;
+            rcu_dereference(ptr_to_next_ptr)
+        }
+    }
+
+    // atomically assign the given pointer as the pointer to the next element
+    pub unsafe fn rcu_assign_next(&self, next: *mut T) {
+        unsafe {
+            let ptr_to_list_entry = self.entry.get();
+            let ptr_to_next_ptr = &mut (*ptr_to_list_entry).next as *mut *mut T;
+            rcu_assign_pointer(ptr_to_next_ptr, next);
+        }
+    }
+}
+
+pub trait RCUGetLinks {
+    
+    type EntryType: RCUGetLinks + GetRCUHead;
+
+    fn get_links(data: &Self::EntryType) -> &RCULinks<Self::EntryType>;
+}
+
+pub struct RCUList<T: RCUGetLinks + GetRCUHead> {
+    head: *mut T::EntryType,
+}
+
+impl<T: RCUGetLinks + GetRCUHead> RCUList<T> {
+    pub fn cursor_front_mut<'a>(&'a mut self) -> RCUListCursorMut<'a, T> {
+        RCUListCursorMut {
+            cur: NonNull::new(self.head),
+            list: self,
+        }
+    }
+
+    pub fn push_back(&mut self, new: Box<T::EntryType>) {
+        // get head ptr
+        let head = NonNull::new(self.head);
+        // convert box to raw pointer to prevent drop
+        let ptr_to_new_item = Box::into_raw(new);
+        // get list entry for new item
+        let ptr_to_new_list_entry = unsafe {
+            T::get_links(&*ptr_to_new_item).entry.get()
+        };
+
+        match head {
+            // if the list is not empty
+            Some(p) => {
+                unsafe {
+                    // get list entry for head
+                    let ptr_to_head_list_entry = T::get_links(&*p.as_ptr()).entry.get();
+                    // get ptr to tail
+                    let ptr_to_tail_item = (*ptr_to_head_list_entry).prev;
+                    // get tail links
+                    let tail_links = T::get_links(&*ptr_to_tail_item);
+                    // get ptr to tail list entry
+                    let ptr_to_tail_list_entry = tail_links.entry.get();
+
+                    // set prev and next ptrs for current item
+                    (*ptr_to_new_list_entry).prev = ptr_to_tail_item;
+                    (*ptr_to_new_list_entry).next = core::ptr::null_mut();
+
+                    // rcu_assign to the tail item's next pointer
+                    tail_links.rcu_assign_next(ptr_to_new_item);
+
+                    // update head's prev pointer
+                    (*ptr_to_head_list_entry).prev = ptr_to_new_item;
+                }
+            },
+            // if list is empty
+            None => {
+                unsafe {
+                    // set up next pointer to be null
+                    (*ptr_to_new_list_entry).next = core::ptr::null_mut();
+                    // set up prev pointer to point to itself (tail)
+                    (*ptr_to_new_list_entry).prev = ptr_to_new_item;
+                    // rcu_assign to the list's head pointer
+                    rcu_assign_pointer(&mut self.head as *mut *mut T::EntryType, ptr_to_new_item);
+                }
+            },
+        }
+    }
+}
+
+pub struct RCUListCursor<T: RCUGetLinks + GetRCUHead> {
+    cur: Option<NonNull<T::EntryType>>,
+}
+
+impl<T: RCUGetLinks + GetRCUHead> RCUListCursor<T> {
+
+    pub fn current(&self) -> Option<&T::EntryType> {
+        Some(unsafe { &*self.cur?.as_ptr()} )
+    }
+
+    pub unsafe fn move_next_rcu(&mut self) {
+        if let Some(p) = self.cur {
+            let next_ptr = unsafe {
+                T::get_links(&*p.as_ptr()).rcu_dereference_next()
+            };
+            self.cur = NonNull::new(next_ptr);
+        }
+    }
+}
+
+pub struct RCUListCursorMut<'a, T: RCUGetLinks + GetRCUHead> {
+    cur: Option<NonNull<T::EntryType>>,
+    list: &'a mut RCUList<T>,
+}
+
+impl<T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'_, T> {
+
+    pub fn current(&mut self) -> Option<&mut T::EntryType> {
+        Some(unsafe { &mut *self.cur?.as_ptr()} )
+    }
+
+    pub unsafe fn move_next_rcu(&mut self) {
+        if let Some(p) = self.cur {
+            let next_ptr = unsafe {
+                T::get_links(&*p.as_ptr()).rcu_dereference_next()
+            };
+            self.cur = NonNull::new(next_ptr);
+        }
+    }
+
+    pub unsafe fn remove_current_rcu(&mut self) {
+        if let Some(p) = self.cur {
+            unsafe {
+                // get pointer to current item's list entry
+                let ptr_to_cur_list_entry = T::get_links(&*p.as_ptr()).entry.get();
+                // get pointer to prev item
+                let ptr_to_prev_item = (*ptr_to_cur_list_entry).prev;
+                // get pointer to next item
+                let ptr_to_next_item = (*ptr_to_cur_list_entry).next;
+
+                // if next ptr is not null
+                if ptr_to_next_item != core::ptr::null_mut() {
+                    // get pointer to next item's list entry
+                    let ptr_to_next_list_entry = T::get_links(&*ptr_to_next_item).entry.get();
+                    // update prev pointer for next item
+                    (*ptr_to_next_list_entry).prev = ptr_to_prev_item;
+                }
+
+                // if this item is the list head, i.e. prev points to tail
+                if p.as_ptr() == self.list.head {
+                    // rcu_assign the list's head pointer
+                    rcu_assign_pointer(&mut self.list.head as *mut *mut T::EntryType, ptr_to_next_item);
+                } else {
+                    // get previous item's links
+                    let prev_list_links = T::get_links(&*ptr_to_prev_item);
+                    // rcu_assign next pointer for prev item
+                    prev_list_links.rcu_assign_next(ptr_to_next_item);
+                }
+                
+
+                // update self.cur
+                self.cur = NonNull::new(ptr_to_next_item);
+
+                // queue removed item for deallocation
+                rcu_free(p.as_ptr());
+            }
+        }
+    }
+
+    pub unsafe fn replace_current_rcu(&mut self, new: Box<T::EntryType>) {
+        if let Some(p) = self.cur {
+            unsafe {
+                // convert box to raw pointer to prevent drop
+                let ptr_to_new_item = Box::into_raw(new);
+                // get pointer to new item's list entry
+                let ptr_to_new_list_entry = T::get_links(&*ptr_to_new_item).entry.get();
+                // get pointer to current item's list entry
+                let ptr_to_cur_list_entry = T::get_links(&*p.as_ptr()).entry.get();
+                
+                // get pointer to prev item
+                let ptr_to_prev_item = (*ptr_to_cur_list_entry).prev;
+                // get pointer to next item
+                let ptr_to_next_item = (*ptr_to_cur_list_entry).next;
+                
+                // set next and prev pointers for new item
+                (*ptr_to_new_list_entry).prev = ptr_to_prev_item;
+                (*ptr_to_cur_list_entry).next = ptr_to_next_item;
+
+                // if this item is the list head, i.e. prev points to tail
+                if p.as_ptr() == self.list.head {
+                    // rcu_assign the list's head pointer
+                    rcu_assign_pointer(&mut self.list.head as *mut *mut T::EntryType, ptr_to_new_item);
+                } else {
+                    // get previous item's links
+                    let prev_list_links = T::get_links(&*ptr_to_prev_item);
+                    // rcu-assign next pointer for prev item
+                    prev_list_links.rcu_assign_next(ptr_to_new_item);
+                }
+                
+                // set prev pointer for next item
+                if ptr_to_next_item != core::ptr::null_mut() {
+                    let ptr_to_next_entry = T::get_links(&*ptr_to_next_item).entry.get();
+                    (*ptr_to_next_entry).prev = ptr_to_new_item;
+                }
+
+                // update self.cur
+                self.cur = NonNull::new(ptr_to_new_item);
+
+                // queue old item for deallocation
+                rcu_free(p.as_ptr());
             }
         }
     }
