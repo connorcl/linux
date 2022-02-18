@@ -131,7 +131,7 @@ fn yama_ptracer_del(tracer_task: Option<TaskStructRef>, tracee_task: Option<Task
             // count = count + 1;
             if !relation_node.invalid {
                 // obs - help consider borrowing here - move during loop
-                if let Some(ref t) = tracer_task {
+                if let Some(t) = &tracer_task {
                     // obs - help consider borrowing here
                     if let PtraceRelation::TracerTracee { tracer, tracee } = &relation_node.relation {
                         if *t == *tracer {
@@ -141,7 +141,7 @@ fn yama_ptracer_del(tracer_task: Option<TaskStructRef>, tracee_task: Option<Task
                     }
                 }
                 // obs - help consider borrowing here - move during loop
-                if let Some(ref t) = tracee_task {
+                if let Some(t) = &tracee_task {
                     if *t == relation_node.relation.get_tracee() {
                         pr_info!("Found match, marking relationship as invalid!\n");
                         relation_node.invalid = true;
@@ -158,29 +158,25 @@ fn yama_ptracer_del(tracer_task: Option<TaskStructRef>, tracee_task: Option<Task
 
 fn task_is_descendant(parent: TaskStructRef, child: TaskStructRef) -> bool {
 
-    if parent.null() || child.null() {
-        return false;
-    }
-
     let mut ret = false;
 
     with_rcu_read_lock(|| {
 
         let mut parent = unsafe {
-            parent.get_thread_group_leader()
+            parent.get_thread_group_leader().unwrap()
         };
         let mut walker = child;
 
         while walker.pid() > 0 {
             walker = unsafe {
-                walker.get_thread_group_leader()
+                walker.get_thread_group_leader().unwrap()
             };
             if walker == parent {
                 ret = true;
                 break;
             }
             walker = unsafe {
-                walker.get_real_parent()
+                walker.get_real_parent().unwrap()
             };
         }
     });
@@ -193,7 +189,7 @@ fn ptracer_exception_found(tracer_task: TaskStructRef, tracee_task: TaskStructRe
         let mut found = false;
         let mut tracee_task = tracee_task;
         let mut parent = unsafe {
-            tracee_task.get_ptrace_parent()
+            tracee_task.get_ptrace_parent().unwrap()
         };
         if !parent.null() && parent.same_thread_group(&tracer_task) {
             pr_info!("Parent: {}, tracer: {}\n", parent.pid(), parent.pid());
@@ -202,7 +198,7 @@ fn ptracer_exception_found(tracer_task: TaskStructRef, tracee_task: TaskStructRe
         }
 
         tracee_task = unsafe { 
-            tracee_task.get_thread_group_leader()
+            tracee_task.get_thread_group_leader().unwrap()
         };
 
         // obs - more elegant than bool, null pointer
@@ -263,15 +259,11 @@ impl SecurityHooks for TestRustLSM {
                 },
                 YAMA_RUST_SCOPE_RELATIONAL => {
                     ret = with_rcu_read_lock(|| {
-                        let child_alive =  unsafe { 
-                            child.pid_alive()
-                        };
-                        let is_descendant = unsafe {
-                            task_is_descendant(TaskStructRef::current(), child.clone())
-                        };
-                        let exception_found = unsafe {
-                            ptracer_exception_found(TaskStructRef::current(), child.clone())
-                        };
+                        let child_alive = child.pid_alive();
+                        let is_descendant =
+                            task_is_descendant(TaskStructRef::current().unwrap(), child.clone());
+                        let exception_found = 
+                            ptracer_exception_found(TaskStructRef::current().unwrap(), child.clone());
                         let has_capability = unsafe {
                             child.user_ns_capable(CAP_SYS_PTRACE)
                         };
@@ -283,8 +275,6 @@ impl SecurityHooks for TestRustLSM {
                             Ok(())
                         }
                     })
-
-
                 },
                 YAMA_RUST_SCOPE_CAPABILITY => {
                     ret = with_rcu_read_lock(|| {
@@ -319,9 +309,7 @@ impl SecurityHooks for TestRustLSM {
 
         if unsafe { PTRACE_SCOPE } == YAMA_RUST_SCOPE_CAPABILITY {
             let has_capability = unsafe {
-                unsafe {
-                    has_ns_capability(parent.get_ptr(), current_user_ns_exported(), CAP_SYS_PTRACE.try_into().unwrap())
-                }
+                has_ns_capability(parent.get_ptr().as_ptr(), current_user_ns_exported(), CAP_SYS_PTRACE.try_into().unwrap())
             };
             if !has_capability {
                 ret = Err(Error::EPERM);
@@ -338,9 +326,7 @@ impl SecurityHooks for TestRustLSM {
     }
 
     fn task_free(task: TaskStructRef) {
-        unsafe { 
-            yama_ptracer_del(Some(task.clone()), Some(task.clone()));
-        }
+        yama_ptracer_del(Some(task.clone()), Some(task.clone()));
     }
 
     fn task_prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) -> Result {
@@ -351,23 +337,17 @@ impl SecurityHooks for TestRustLSM {
 
             let mut myself = with_rcu_read_lock(|| {
                 unsafe {
-                    TaskStructRef::current_get().get_thread_group_leader()
+                    TaskStructRef::current_get().unwrap().get_thread_group_leader().unwrap()
                 }
             });
 
             // no tracing permitted
             if arg2 == 0 {
                 pr_info!("Removing tracee relationship!\n");
-                let null_task = unsafe {
-                    TaskStructRef::from_ptr(null_mut())
-                };
                 yama_ptracer_del(None, Some(myself));
                 ret = Ok(());
             } else if arg2 as i32 == -1 {
                 pr_info!("Adding tracee relationship: any tracer!\n");
-                let null_task = unsafe {
-                    TaskStructRef::from_ptr(null_mut())
-                };
                 yama_ptracer_add(PtraceRelation::AnyTracer {
                     tracee: myself,
                 });
@@ -380,7 +360,7 @@ impl SecurityHooks for TestRustLSM {
                     ret = Err(Error::EINVAL);
                 } else {
                     let tracer = unsafe {
-                        TaskStructRef::from_ptr(tracer)
+                        TaskStructRef::from_ptr(tracer).unwrap()
                     };
                     yama_ptracer_add(PtraceRelation::TracerTracee {
                         tracer: tracer,
