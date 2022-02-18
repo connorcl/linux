@@ -529,6 +529,15 @@ pub struct RCULinks<T> {
 
 impl<T> RCULinks<T> {
 
+    pub fn new() -> RCULinks<T> {
+        RCULinks {
+            entry: UnsafeCell::new(RCUListEntry {
+                next: core::ptr::null_mut(),
+                prev: core::ptr::null_mut(),
+            }),
+        }
+    }
+
     // rcu-dereference and return the pointer to the next element
     pub unsafe fn rcu_dereference_next(&self) -> *mut T {
         unsafe {
@@ -552,7 +561,7 @@ pub trait RCUGetLinks {
     
     type EntryType: RCUGetLinks + GetRCUHead;
 
-    fn get_links(data: &Self::EntryType) -> &RCULinks<Self::EntryType>;
+    fn get_links(data: &mut Self::EntryType) -> &mut RCULinks<Self::EntryType>;
 }
 
 pub struct RCUList<T: RCUGetLinks + GetRCUHead> {
@@ -560,9 +569,16 @@ pub struct RCUList<T: RCUGetLinks + GetRCUHead> {
 }
 
 impl<T: RCUGetLinks + GetRCUHead> RCUList<T> {
-    pub fn cursor_front_mut<'a>(&'a mut self) -> RCUListCursorMut<'a, T> {
+
+    pub fn new() -> RCUList<T> {
+        RCUList {
+            head: core::ptr::null_mut(),
+        }
+    }
+
+    pub unsafe fn cursor_front_mut_rcu<'a>(&'a mut self) -> RCUListCursorMut<'a, T> {
         RCUListCursorMut {
-            cur: NonNull::new(self.head),
+            cur: NonNull::new(unsafe { rcu_dereference(&mut self.head as *mut *mut T::EntryType) }),
             list: self,
         }
     }
@@ -574,7 +590,7 @@ impl<T: RCUGetLinks + GetRCUHead> RCUList<T> {
         let ptr_to_new_item = Box::into_raw(new);
         // get list entry for new item
         let ptr_to_new_list_entry = unsafe {
-            T::get_links(&*ptr_to_new_item).entry.get()
+            T::get_links(&mut *ptr_to_new_item).entry.get()
         };
 
         match head {
@@ -582,11 +598,11 @@ impl<T: RCUGetLinks + GetRCUHead> RCUList<T> {
             Some(p) => {
                 unsafe {
                     // get list entry for head
-                    let ptr_to_head_list_entry = T::get_links(&*p.as_ptr()).entry.get();
+                    let ptr_to_head_list_entry = T::get_links(&mut *p.as_ptr()).entry.get();
                     // get ptr to tail
                     let ptr_to_tail_item = (*ptr_to_head_list_entry).prev;
                     // get tail links
-                    let tail_links = T::get_links(&*ptr_to_tail_item);
+                    let tail_links = T::get_links(&mut *ptr_to_tail_item);
                     // get ptr to tail list entry
                     let ptr_to_tail_list_entry = tail_links.entry.get();
 
@@ -629,7 +645,7 @@ impl<T: RCUGetLinks + GetRCUHead> RCUListCursor<T> {
     pub unsafe fn move_next_rcu(&mut self) {
         if let Some(p) = self.cur {
             let next_ptr = unsafe {
-                T::get_links(&*p.as_ptr()).rcu_dereference_next()
+                T::get_links(&mut *p.as_ptr()).rcu_dereference_next()
             };
             self.cur = NonNull::new(next_ptr);
         }
@@ -650,7 +666,7 @@ impl<T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'_, T> {
     pub unsafe fn move_next_rcu(&mut self) {
         if let Some(p) = self.cur {
             let next_ptr = unsafe {
-                T::get_links(&*p.as_ptr()).rcu_dereference_next()
+                T::get_links(&mut *p.as_ptr()).rcu_dereference_next()
             };
             self.cur = NonNull::new(next_ptr);
         }
@@ -660,7 +676,7 @@ impl<T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'_, T> {
         if let Some(p) = self.cur {
             unsafe {
                 // get pointer to current item's list entry
-                let ptr_to_cur_list_entry = T::get_links(&*p.as_ptr()).entry.get();
+                let ptr_to_cur_list_entry = T::get_links(&mut *p.as_ptr()).entry.get();
                 // get pointer to prev item
                 let ptr_to_prev_item = (*ptr_to_cur_list_entry).prev;
                 // get pointer to next item
@@ -669,7 +685,7 @@ impl<T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'_, T> {
                 // if next ptr is not null
                 if ptr_to_next_item != core::ptr::null_mut() {
                     // get pointer to next item's list entry
-                    let ptr_to_next_list_entry = T::get_links(&*ptr_to_next_item).entry.get();
+                    let ptr_to_next_list_entry = T::get_links(&mut *ptr_to_next_item).entry.get();
                     // update prev pointer for next item
                     (*ptr_to_next_list_entry).prev = ptr_to_prev_item;
                 }
@@ -680,7 +696,7 @@ impl<T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'_, T> {
                     rcu_assign_pointer(&mut self.list.head as *mut *mut T::EntryType, ptr_to_next_item);
                 } else {
                     // get previous item's links
-                    let prev_list_links = T::get_links(&*ptr_to_prev_item);
+                    let prev_list_links = T::get_links(&mut *ptr_to_prev_item);
                     // rcu_assign next pointer for prev item
                     prev_list_links.rcu_assign_next(ptr_to_next_item);
                 }
@@ -701,9 +717,9 @@ impl<T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'_, T> {
                 // convert box to raw pointer to prevent drop
                 let ptr_to_new_item = Box::into_raw(new);
                 // get pointer to new item's list entry
-                let ptr_to_new_list_entry = T::get_links(&*ptr_to_new_item).entry.get();
+                let ptr_to_new_list_entry = T::get_links(&mut *ptr_to_new_item).entry.get();
                 // get pointer to current item's list entry
-                let ptr_to_cur_list_entry = T::get_links(&*p.as_ptr()).entry.get();
+                let ptr_to_cur_list_entry = T::get_links(&mut *p.as_ptr()).entry.get();
                 
                 // get pointer to prev item
                 let ptr_to_prev_item = (*ptr_to_cur_list_entry).prev;
@@ -720,14 +736,14 @@ impl<T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'_, T> {
                     rcu_assign_pointer(&mut self.list.head as *mut *mut T::EntryType, ptr_to_new_item);
                 } else {
                     // get previous item's links
-                    let prev_list_links = T::get_links(&*ptr_to_prev_item);
+                    let prev_list_links = T::get_links(&mut *ptr_to_prev_item);
                     // rcu-assign next pointer for prev item
                     prev_list_links.rcu_assign_next(ptr_to_new_item);
                 }
                 
                 // set prev pointer for next item
                 if ptr_to_next_item != core::ptr::null_mut() {
-                    let ptr_to_next_entry = T::get_links(&*ptr_to_next_item).entry.get();
+                    let ptr_to_next_entry = T::get_links(&mut *ptr_to_next_item).entry.get();
                     (*ptr_to_next_entry).prev = ptr_to_new_item;
                 }
 
