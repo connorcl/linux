@@ -12,53 +12,71 @@ use kernel::linked_list::*;
 use core::cell::UnsafeCell;
 use kernel::container_of;
 use kernel::c_str;
+use kernel::gen_sysctl_path;
 
 // LSM name - serves as a unique identifier for this security module
-const __NAME: &[u8] = b"test_rust_lsm\0";
+const __NAME: &[u8] = b"yama_rust\0";
 // log prefix required for pr_info
 const __LOG_PREFIX: &[u8] = __NAME;
 
-const YAMA_RUST_SCOPE_DISABLED: c_int = 0;
-const YAMA_RUST_SCOPE_RELATIONAL: c_int = 1;
-const YAMA_RUST_SCOPE_CAPABILITY: c_int = 2;
-const YAMA_RUST_SCOPE_NO_ATTACH: c_int = 3;
+#[derive(Copy, Clone)]
+enum PtraceScope {
+    Disabled = 0,
+    Relational = 1,
+    Capability = 2,
+    NoAttach = 3,
+}
 
-static mut PTRACE_SCOPE: c_int = YAMA_RUST_SCOPE_RELATIONAL;
+impl PtraceScope {
+    pub(crate) const fn max() -> i32 {
+        PtraceScope::NoAttach as i32
+    }
 
-static mut yama_relation_work: work_struct = work_struct {
-    data: atomic_long_t {
-        counter: (WORK_STRUCT_NO_POOL | WORK_STRUCT_STATIC),
-    },
-    entry: list_head {
-        next: unsafe { &yama_relation_work.entry as *const _ as *mut _ },
-        prev: unsafe { &yama_relation_work.entry as *const _ as *mut _ },
-    },
-    func: Some(yama_relation_cleanup),
-};
+    pub(crate) const fn min() -> i32 {
+        PtraceScope::Disabled as i32
+    }
+
+    pub (crate) const fn default() -> i32 {
+        PtraceScope::Relational as i32
+    }
+
+    pub(crate) fn from_int(x: i32) -> Option<PtraceScope> {
+        if x == PtraceScope::Disabled as i32 {
+            Some(PtraceScope::Disabled)
+        } else if x == PtraceScope::Relational as i32 {
+            Some(PtraceScope::Relational)
+        } else if x == PtraceScope::Capability as i32 {
+            Some(PtraceScope::Capability)
+        } else if x == PtraceScope::NoAttach as i32 {
+            Some(PtraceScope::NoAttach)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn to_int(&self) -> i32 {
+        *self as i32
+    }
+}
+
+static ptrace_relation_list_cleanup_work: 
+    StaticWorkStruct<PtraceRelationListCleanup> = StaticWorkStruct::new();
 
 struct AccessReportInfo {
-    work: callback_head,
     access: &'static CStr,
     target: Option<TaskStructRef>,
     agent: Option<TaskStructRef>,
 }
 
-unsafe extern "C" fn yama_relation_cleanup(work: *mut work_struct) {
-    pr_info!("Relation cleanup from work queue!\n");
-    ptracer_relations.cleanup_relations();
+struct ReportAccessWorkFunc;
+
+impl DynamicWorkFunc<AccessReportInfo> for ReportAccessWorkFunc {
+    fn work_func(data: &AccessReportInfo) {
+        pr_info!("Report access: {}\n", data.access);
+    }
 }
 
-unsafe extern "C" fn __report_access(work: *mut callback_head) {
-    
-    let info = unsafe {
-        Box::from_raw(container_of!(work, AccessReportInfo, work) as *mut AccessReportInfo)
-    };
-    
-    pr_info!("Report access: {}\n", (*info).access);
-
-    // box goes out of scope, deallocating the AccessReportInfo struct,
-    // and dropping its TaskStructRefs (calling put_task_struct)
-}
+type ReportAccessPayload = DynamicWorkPayload<AccessReportInfo, ReportAccessWorkFunc>;
 
 fn report_access(access: &'static CStr, mut target: TaskStructRef, mut agent: TaskStructRef) {
 
@@ -74,88 +92,40 @@ fn report_access(access: &'static CStr, mut target: TaskStructRef, mut agent: Ta
     target.get();
     agent.get();
 
-    let info = Box::try_new(AccessReportInfo {
-        work: callback_head {
-            next: null_mut(),
-            func: Some(__report_access),
-        },
-        access: access,
-        target: Some(target),
-        agent: Some(agent),
-    }).unwrap();
-
-    // convert to raw pointer to prevent drop
-    let info_ptr = Box::into_raw(info);
-
-    let ret = unsafe {
-        task_work_add(current, &(*info_ptr).work as *const _ as *mut _, task_work_notify_mode_TWA_RESUME)
-    };
-    pr_info!("Task work add: {}\n", ret);
+    ReportAccessPayload::create_and_schedule(
+        AccessReportInfo {
+            access: access,
+            target: Some(target),
+            agent: Some(agent),
+        }
+    );
 }
 
+struct PtraceScopeSysctlIntHooks;
 
-unsafe extern "C" fn yama_dointvec_minmax(table: *mut ctl_table, write: c_int,
-    buffer: *mut c_void, lenp: *mut c_size_t, ppos: *mut loff_t) -> c_int {
+impl SysctlIntHooks for PtraceScopeSysctlIntHooks {
+    fn write_hook(table: &mut ctl_table) -> Result<()> {
+        if unsafe { !capable(CAP_SYS_PTRACE.try_into().unwrap()) } {
+            pr_info!("Setting ptrace scope not permitted!\n");
+            return Err(Error::EPERM);
+        }
+    
+        if unsafe { *(table.data as *mut c_int) } == unsafe { *(table.extra2 as *mut c_int) } {
+            pr_info!("Locking scope to highest value!\n");
+            table.extra1 = table.extra2;
+        }
 
-    let mut table_copy = unsafe {
-        *table
-    };
-
-    if write != 0 && unsafe { !capable(CAP_SYS_PTRACE.try_into().unwrap()) } {
-        pr_info!("Setting ptrace scope not permitted!\n");
-        return Error::EPERM.to_kernel_errno();
+        Ok(())
     }
-
-    if unsafe { *(table_copy.data as *mut c_int) } == unsafe { *(table_copy.extra2 as *mut c_int) } {
-        pr_info!("Locking scope to highest value!\n");
-        table_copy.extra1 = table_copy.extra2;
-    }
-
-	return unsafe {
-        proc_dointvec_minmax(&mut table_copy as *mut _, write, buffer, lenp, ppos)
-    };
 }
 
-static max_scope: c_int = YAMA_RUST_SCOPE_NO_ATTACH;
-static min_scope: c_int = YAMA_RUST_SCOPE_DISABLED;
-
-static mut yama_rust_sysctl_path: [ctl_path; 3] = [
-    ctl_path {
-        procname: c_str!("kernel").as_char_ptr(),
-    },
-    ctl_path {
-        procname: c_str!("yama").as_char_ptr(),
-    },
-    ctl_path {
-        procname: core::ptr::null(),
-    }
-];
-
-static mut yama_rust_sysctl_table: [ctl_table; 2] = [
-    ctl_table {
-        procname: c_str!("ptrace_scope").as_char_ptr(),
-        data: unsafe { &PTRACE_SCOPE as *const _ as *mut c_void },
-        maxlen: core::mem::size_of::<c_int>() as i32,
-        mode: 0o0644 as _,
-        child: null_mut(),
-        proc_handler: Some(yama_dointvec_minmax),
-        poll: null_mut(),
-        extra1: &min_scope as *const _ as *mut c_void,
-        extra2: &max_scope as *const _ as *mut c_void,
-    },
-    ctl_table {
-        procname: core::ptr::null(),
-        data: null_mut(),
-        maxlen: 0,
-        mode: 0,
-        child: null_mut(),
-        proc_handler: None,
-        poll: null_mut(),
-        extra1: null_mut(),
-        extra2: null_mut(),
-    },
-];
-
+static yama_rust_ptrace_scope: SysctlInt<PtraceScopeSysctlIntHooks> = 
+    SysctlInt::new(
+        PtraceScope::default(),
+        PtraceScope::min(),
+        PtraceScope::max(),
+        gen_sysctl_path!("kernel", "yama")
+    );
 
 #[derive(Clone)]
 enum PtraceRelation {
@@ -217,21 +187,22 @@ impl RCUGetLinks for PtraceRelationNode {
 static ptracer_relations: PtraceRelationListOuter = PtraceRelationListOuter::new();
 
 struct PtraceRelationListOuter {
-    list: UnsafeCell<PtraceRelationList>,
+    list: InitCell<PtraceRelationList>,
 }
 
 unsafe impl Sync for PtraceRelationListOuter { }
+
 impl PtraceRelationListOuter {
     pub(crate) const fn new() -> PtraceRelationListOuter {
         PtraceRelationListOuter { 
-            list: UnsafeCell::new(PtraceRelationList::Uninitialized),
+            list: InitCell::new(PtraceRelationList::Uninitialized),
         }
     }
 
     // must not be run concurrently with any other methods
     #[link_section = ".init.text"]
-    pub(crate) unsafe fn init(&self) {
-        let r = unsafe { &mut *self.list.get() };
+    pub(crate) unsafe fn init(&self, init_ctx: InitContextRef<'_>) {
+        let r = unsafe { &mut *self.list.get(init_ctx) };
 
         if let PtraceRelationList::Uninitialized = r {
             *r = PtraceRelationList::new_init();
@@ -240,7 +211,7 @@ impl PtraceRelationListOuter {
 
     pub(crate) fn if_initialized<R, F: FnOnce(&PtraceRelationListInner) -> R>(&self, f: F) -> Result<R> {
         // safe assuming init cannot be called concurrently
-        let list = unsafe { &*self.list.get() };
+        let list = self.list.get_ref();
         if let PtraceRelationList::Initialized { inner } = list {
             Ok(f(inner))
         } else {
@@ -295,14 +266,12 @@ impl PtraceRelationList {
 
 struct PtraceRelationListCleanup;
 
-impl WorkFunc for PtraceRelationListCleanup {
+impl StaticWorkFunc for PtraceRelationListCleanup {
     fn work_func(work: *mut work_struct) {
         pr_info!("Relation cleanup from work queue!\n");
         ptracer_relations.cleanup_relations();
     }
 }
-
-// static ptrace_relation_list_cleanup: UnsafeCell<WorkStruct<PtraceRelationListCleanup>>
 
 struct PtraceRelationListInner {
     // list
@@ -419,11 +388,13 @@ impl PtraceRelationListInner {
             }
             // pr_info!("Relationships: {}\n", count);
 
-            if marked {
-                unsafe {
-                    schedule_work_exported(&mut yama_relation_work as *mut _);
-                }
-            }
+            // if marked {
+            //     unsafe {
+            //         schedule_work_exported(&mut yama_relation_work as *mut _);
+            //     }
+            // }
+
+            ptrace_relation_list_cleanup_work.schedule();
         });
     }
 
@@ -501,9 +472,9 @@ fn task_is_descendant(parent: TaskStructRef, child: TaskStructRef) -> bool {
     ret
 }
 
-struct TestRustLSM;
+struct YamaRust;
 
-impl SecurityHooks for TestRustLSM {
+impl SecurityHooks for YamaRust {
 
     fn ptrace_access_check(child: TaskStructRef, mode: c_uint) -> Result {
 
@@ -515,11 +486,11 @@ impl SecurityHooks for TestRustLSM {
 
             pr_info!("Ptrace attach!\n");
 
-            match unsafe { PTRACE_SCOPE } {
-                YAMA_RUST_SCOPE_DISABLED => {
+            match PtraceScope::from_int(yama_rust_ptrace_scope.get_value()) {
+                Some(PtraceScope::Disabled) => {
                     ret = Ok(());
                 },
-                YAMA_RUST_SCOPE_RELATIONAL => {
+                Some(PtraceScope::Relational) => {
                     ret = with_rcu_read_lock(|ctx| {
                         let child_alive = child.pid_alive();
                         let is_descendant =
@@ -536,7 +507,7 @@ impl SecurityHooks for TestRustLSM {
                         }
                     });
                 },
-                YAMA_RUST_SCOPE_CAPABILITY => {
+                Some(PtraceScope::Capability) => {
                     ret = with_rcu_read_lock(|ctx| {
                         let has_capability = child.user_ns_capable(CAP_SYS_PTRACE, ctx);
                         if !has_capability {
@@ -547,11 +518,11 @@ impl SecurityHooks for TestRustLSM {
                         }
                     });
                 },
-                YAMA_RUST_SCOPE_NO_ATTACH => {
+                Some(PtraceScope::NoAttach) => {
                     pr_info!("Denied!\n");
                     ret = Err(Error::EPERM);
                 },
-                _ => {
+                None => {
                     pr_info!("Denied!\n");
                     ret = Err(Error::EPERM);
                 }
@@ -565,7 +536,7 @@ impl SecurityHooks for TestRustLSM {
 
         let mut ret = Ok(());
 
-        if unsafe { PTRACE_SCOPE } == YAMA_RUST_SCOPE_CAPABILITY {
+        if let Some(PtraceScope::Capability) = PtraceScope::from_int(yama_rust_ptrace_scope.get_value()) {
             let has_capability = unsafe {
                 has_ns_capability(parent.get_ptr().as_ptr(), current_user_ns_exported(), CAP_SYS_PTRACE.try_into().unwrap())
             };
@@ -573,7 +544,7 @@ impl SecurityHooks for TestRustLSM {
                 ret = Err(Error::EPERM);
                 pr_info!("Traceme denied!\n");
             }
-        } else if unsafe { PTRACE_SCOPE } == YAMA_RUST_SCOPE_NO_ATTACH {
+        } else if let Some(PtraceScope::NoAttach) = PtraceScope::from_int(yama_rust_ptrace_scope.get_value()) {
             pr_info!("Traceme denied!\n");
             ret = Err(Error::EPERM);
         } else {
@@ -635,28 +606,37 @@ impl SecurityHooks for TestRustLSM {
     }
 }
 
-impl SecurityModule for TestRustLSM {
+impl SecurityModule for YamaRust {
     #[link_section = ".init.text"]
-    fn init(hooks: &mut SecurityHookList) -> Result {
-        pr_info!("Successfully initialized simple Rust LSM!\n");
+    fn init(hooks: &mut SecurityHookList, init_ctx: InitContextRef<'_>) -> Result {
+        pr_info!("Initializing Yama-Rust!\n");
 
-        // SAFETY: no other methods will be getting called as
-        // hooks are not yet registered
+        // SAFETY: exclusive write access from this init function,
+        // and no read accesses as hooks have not been registered
         unsafe {
-            ptracer_relations.init();
+            ptracer_relations.init(init_ctx);
         }
 
-        // SAFETY: register is being called during init, 
-        // and there is no other access to hooks array
-        let ret = unsafe { hooks.register() };
+        // SAFETY: exclusive write access from this init function,
+        // and no read accesses as hooks have not been registered
+        unsafe {
+            ptrace_relation_list_cleanup_work.init(init_ctx);
+        }
 
-        let sret = unsafe {
-            register_sysctl_paths(&yama_rust_sysctl_path as *const _, 
-                &yama_rust_sysctl_table as *const _ as *mut _)
-        };
-        let a = sret != null_mut();
-        pr_info!("Registering sysctl paths: {}\n", a);
+        // SAFETY: there is no other access to hooks array
+        let ret = unsafe { hooks.register(init_ctx) };
 
+        // SAFETY: exclusive write access from this init function,
+        // and no read accesses until the next line (register)
+        unsafe {
+            yama_rust_ptrace_scope.init(
+                c_str!("ptrace_scope"),
+                0o0644,
+                init_ctx,
+            );
+        }
+
+        yama_rust_ptrace_scope.register();
 
         match ret {
             Ok(_) => {
@@ -672,7 +652,7 @@ impl SecurityModule for TestRustLSM {
 }
 
 define_lsm!(
-    "test_rust_lsm",
-    TestRustLSM,
+    "yama_rust",
+    YamaRust,
     ptrace_access_check, ptrace_traceme, task_free, task_prctl
 );

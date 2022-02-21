@@ -3,11 +3,36 @@ use crate::bindings::*;
 use crate::c_types::*;
 use crate::error::Error;
 use crate::str::CStr;
+use crate::container_of;
 use core::marker::{PhantomData, PhantomPinned};
 use alloc::boxed::Box;
 use core::convert::TryInto;
 use core::ptr::NonNull;
 use core::cell::UnsafeCell;
+use crate::c_str;
+
+// an abstraction over UnsafeCell that allows mutable 
+// access only during init, simplifying its safe use
+pub struct InitCell<T> {
+    data: UnsafeCell<T>,
+}
+
+impl<T> InitCell<T> {
+    pub const fn new(data: T) -> InitCell<T> {
+        InitCell {
+            data: UnsafeCell::new(data),
+        }
+    }
+
+    #[link_section = ".init.text"]
+    pub const fn get(&self, _init_ctx: InitContextRef<'_>) -> *mut T {
+        self.data.get()
+    }
+
+    pub const fn get_ref(&self) -> &T {
+        unsafe { &*self.data.get() }
+    }
+}
 
 pub struct SecurityHookList {
     lsm_name: &'static CStr,
@@ -34,7 +59,7 @@ impl SecurityHookList {
     // Preconditions: must be called during init phase, 
     // reference to hook_list must not exist outside self
     #[link_section = ".init.text"]
-    pub unsafe fn register(&mut self) -> Result {
+    pub unsafe fn register(&mut self, _init_ctx: InitContextRef<'_>) -> Result {
         // check name is null terminated
         // if self.lsm_name.len() <= 1 || self.lsm_name[self.lsm_name.len() - 1] != 0u8 {
         //     pr_info!("Name empty or invalid!\n");
@@ -138,7 +163,7 @@ impl<T: SecurityHooks> LSMHooks<T> {
 }
 
 pub trait SecurityModule {
-    fn init(hooks: &mut SecurityHookList) -> Result;
+    fn init(hooks: &mut SecurityHookList, init_ctx: InitContextRef<'_>) -> Result;
 }
 
 pub struct DefineLSMTraitBoundCheck<T: SecurityHooks + SecurityModule> {
@@ -198,16 +223,18 @@ macro_rules! define_lsm {
 
         //  LSM initialization function, stored in init section
         #[link_section = ".init.text"]
-        extern "C" fn __lsm_init_fn() -> c_int {
-            let ret = unsafe { <$a>::init(&mut __lsm_hooks) };
-            match ret {
-                Ok(_) => {
-                    return 0;
-                },
-                Err(e) => {
-                    return e.to_kernel_errno();
+        unsafe extern "C" fn __lsm_init_fn() -> c_int {
+            in_init_ctx(|init_ctx| {
+                let ret = unsafe { <$a>::init(&mut __lsm_hooks, init_ctx) };
+                match ret {
+                    Ok(_) => {
+                        return 0;
+                    },
+                    Err(e) => {
+                        return e.to_kernel_errno();
+                    }
                 }
-            }
+            })
         }
 
         // register LSM by placing an lsm_info struct into the .lsm_info.init section
@@ -848,52 +875,270 @@ impl<T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'_, T> {
 //     ptracer_relations.cleanup_relations();
 // }
 
-pub trait WorkFunc {
+struct InitContext {
+    _private: PhantomData<()>,
+}
+
+impl InitContext {
+    // SFAETY: caller must ensure instances do not outlive init context
+    unsafe fn new() -> InitContext {
+        InitContext {
+            _private: PhantomData,
+        }
+    }
+
+    fn get_ref<'a>(&'a self) -> InitContextRef<'a> {
+        return InitContextRef {
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[link_section = ".init.text"]
+pub fn in_init_ctx<R, F: FnOnce(InitContextRef<'_>) -> R>(f: F) -> R {
+    // SAFETY: init context instance is created and dropped
+    // in function only callable during init
+    let init_ctx = unsafe {
+        InitContext::new()
+    };
+    // call closure
+    f(init_ctx.get_ref())
+}
+
+#[derive(Copy, Clone)]
+pub struct InitContextRef<'a> {
+    _marker: PhantomData<&'a InitContext>,
+}
+
+pub trait StaticWorkFunc {
     fn work_func(work: *mut work_struct);
 }
 
-struct WorkFuncCInterface<T: WorkFunc> {
+struct StaticWorkFuncCInterface<T: StaticWorkFunc> {
     _marker: PhantomData<T>,
 }
 
-impl<T: WorkFunc> WorkFuncCInterface<T> {
+impl<T: StaticWorkFunc> StaticWorkFuncCInterface<T> {
     pub(crate) unsafe extern "C" fn work_func(work: *mut work_struct) {
         T::work_func(work);
     }
 }
 
-pub struct WorkStruct<T: WorkFunc> {
-    work: work_struct,
+pub struct StaticWorkStruct<T: StaticWorkFunc> {
+    work: InitCell<Option<work_struct>>,
     _marker: PhantomData<T>,
     _pin: PhantomPinned,
 }
 
-impl<T: WorkFunc> WorkStruct<T> {
-    pub fn new() -> WorkStruct<T> {
-        let mut a = WorkStruct {
-            work: work_struct {
-                data: atomic_long_t {
-                    counter: (WORK_STRUCT_NO_POOL | WORK_STRUCT_STATIC),
-                },
-                entry: list_head {
-                    next: core::ptr::null_mut(),
-                    prev: core::ptr::null_mut(),
-                },
-                func: Some(WorkFuncCInterface::<T>::work_func),
-            },
+impl<T: StaticWorkFunc> StaticWorkStruct<T> {
+
+    pub const fn new() -> StaticWorkStruct<T> {
+        StaticWorkStruct {
+            work: InitCell::new(None),
             _marker: PhantomData,
             _pin: PhantomPinned,
-        };
-        a.work.entry.next = &a.work.entry as *const _ as *mut _;
-        a.work.entry.prev = &a.work.entry as *const _ as *mut _;
-        return a;
+        }
+    }
+
+    #[link_section = ".init.text"]
+    pub unsafe fn init(&'static self, init_ctx: InitContextRef<'_>) {
+        // SAFETY: mutating data is safe during init phase
+        unsafe {
+            *self.work.get(init_ctx) = Some(
+                work_struct {
+                    data: atomic_long_t {
+                        counter: (WORK_STRUCT_NO_POOL | WORK_STRUCT_STATIC),
+                    },
+                    entry: list_head {
+                        next: core::ptr::null_mut(),
+                        prev: core::ptr::null_mut(),
+                    },
+                    func: Some(StaticWorkFuncCInterface::<T>::work_func),
+                }
+            );
+            if let Some(ref mut work) = *self.work.get(init_ctx) {
+                work.entry.next = &mut work.entry as *mut _;
+                work.entry.prev = &mut work.entry as *mut _;
+            }
+        }
     }
 
     pub fn schedule(&'static self) {
-        // self.work.entry.next = &self.work.entry as *const _ as *mut _;
-        // self.work.entry.prev = &self.work.entry as *const _ as *mut _;
-        unsafe {
-            schedule_work_exported(&self as *const _ as *mut _);
+        // SAFETY: pointer is guaranteed to be valid and is 
+        // immediately converted to an immutable reference
+        if let Some(work) = self.work.get_ref() {
+            // SAFETY: FFI call, self is static so work will be valid
+            unsafe {
+                schedule_work_exported(work as *const _ as *mut _);
+            }
         }
     }
 }
+
+unsafe impl<T: StaticWorkFunc> Sync for StaticWorkStruct<T> { }
+
+pub trait DynamicWorkFunc<T> {
+    fn work_func(data: &T);
+}
+
+struct DynamicWorkFuncCInterface<T, U: DynamicWorkFunc<T>> {
+    _marker_t: PhantomData<T>,
+    _marker_u: PhantomData<U>,
+}
+
+impl<T, U: DynamicWorkFunc<T>> DynamicWorkFuncCInterface<T, U> {
+    pub(crate) unsafe extern "C" fn work_func(work: *mut callback_head) {
+        // SAFETY: callback_head pts to field of Box-allocated work payload
+        let payload = unsafe {
+            Box::from_raw(container_of!(work, DynamicWorkPayload<T, U>, work_head) as *mut DynamicWorkPayload<T, U>)
+        };
+        U::work_func(&(*payload).data);
+        // box goes out of scope and dynamicaly allocated payload is freed
+    }
+}
+
+pub struct DynamicWorkPayload<T, U: DynamicWorkFunc<T>> {
+    data: T,
+    work_head: callback_head,
+    _marker: PhantomData<U>,
+}
+
+impl<T, U: DynamicWorkFunc<T>> DynamicWorkPayload<T, U> {
+
+    pub fn create_and_schedule(data: T) {
+
+        // dynamically allocate a new payload
+        let payload: Box<DynamicWorkPayload<T, U>> = Box::try_new(DynamicWorkPayload {
+            data: data,
+            work_head: callback_head {
+                next: core::ptr::null_mut(),
+                func: Some(DynamicWorkFuncCInterface::<T, U>::work_func)
+            },
+            _marker: PhantomData,
+        }).unwrap();
+        // covert to raw pointer to prevent drop
+        let payload = Box::into_raw(payload);
+
+        let current = unsafe {
+            TaskStructRef::current().unwrap().get_ptr().as_ptr()
+        };
+
+        let ret = unsafe {
+            task_work_add(current, &(*payload).work_head as *const _ as *mut _, task_work_notify_mode_TWA_RESUME)
+        };
+        pr_info!("Task work add: {}\n", ret);
+    }
+}
+
+#[macro_export]
+macro_rules! gen_sysctl_path {
+    ( $($p:literal),+ ) => {
+        &[
+            $(
+                ctl_path {
+                    procname: c_str!($p).as_char_ptr(),
+                },
+            )*
+            ctl_path {
+                procname: core::ptr::null(),
+            },
+        ]
+    }
+}
+
+pub trait SysctlIntHooks {
+    fn write_hook(table: &mut ctl_table) -> Result<()>;
+}
+
+struct SysctlDoIntVecMinMax<T: SysctlIntHooks> {
+    _marker: PhantomData<T>,
+}
+
+impl<T: SysctlIntHooks> SysctlDoIntVecMinMax<T> {
+    pub(crate) unsafe extern "C" fn dointvec_minmax(table: *mut ctl_table, write: c_int,
+        buffer: *mut c_void, lenp: *mut c_size_t, ppos: *mut loff_t) -> c_int {
+
+        let mut table_copy = unsafe {
+            *table
+        };
+
+        if write != 0 {
+            if let Err(e) = T::write_hook(&mut table_copy) {
+                return e.to_kernel_errno();
+            }
+        }
+
+        return unsafe {
+            proc_dointvec_minmax(&mut table_copy as *mut _, write, buffer, lenp, ppos)
+        };
+    }
+}
+
+pub struct SysctlInt<T: SysctlIntHooks> {
+    val: c_int,
+    min: c_int,
+    max: c_int,
+    sysctl_path: &'static [ctl_path],
+    sysctl_table: InitCell<Option<[ctl_table; 2]>>,
+    _marker: PhantomData<T>,
+}
+
+impl<T: SysctlIntHooks> SysctlInt<T> {
+    pub const fn new(default: c_int, min: c_int, max: c_int, path: &'static [ctl_path]) -> SysctlInt<T> {
+        SysctlInt {
+            val: default,
+            min: min,
+            max: max,
+            sysctl_path: path,
+            sysctl_table: InitCell::new(None),
+            _marker: PhantomData,
+        }
+    }
+
+    pub const fn get_value(&self) -> c_int {
+        self.val
+    }
+
+    #[link_section = ".init.text"]
+    pub unsafe fn init(&'static self, name: &'static CStr, mode: u16, init_ctx: InitContextRef<'_>) {
+        // SAFETY: intialization in init context
+        let r = unsafe { &mut *self.sysctl_table.get(init_ctx) };
+        *r = Some([
+            ctl_table {
+                procname: name.as_char_ptr(),
+                data: &self.val as *const _ as *mut c_void,
+                maxlen: core::mem::size_of::<c_int>() as i32,
+                mode: mode as _,
+                child: core::ptr::null_mut(),
+                proc_handler: Some(SysctlDoIntVecMinMax::<T>::dointvec_minmax),
+                poll: core::ptr::null_mut(),
+                extra1: &self.min as *const _ as *mut c_void,
+                extra2: &self.max as *const _ as *mut c_void,
+            },
+            ctl_table {
+                procname: core::ptr::null(),
+                data: core::ptr::null_mut(),
+                maxlen: 0,
+                mode: 0,
+                child: core::ptr::null_mut(),
+                proc_handler: None,
+                poll: core::ptr::null_mut(),
+                extra1: core::ptr::null_mut(),
+                extra2: core::ptr::null_mut(),
+            },
+        ])
+    }
+
+    pub fn register(&'static self) {
+        if let Some(t) = self.sysctl_table.get_ref() {
+            let sret = unsafe {
+                register_sysctl_paths(self.sysctl_path.as_ptr() as *const _, 
+                    t as *const _ as *mut _)
+            };
+            let a = sret != core::ptr::null_mut();
+            pr_info!("Registering sysctl paths: {}\n", a);
+        }
+    }
+}
+
+unsafe impl<T: SysctlIntHooks> Sync for SysctlInt<T> { }
