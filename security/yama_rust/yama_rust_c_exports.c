@@ -58,3 +58,7 @@ struct user_namespace *current_user_ns_exported(void) {
 bool schedule_work_exported(struct work_struct *work) {
     return schedule_work(work);
 }
+
+bool capable_exported(int cap) {
+    return capable(cap);
+}
