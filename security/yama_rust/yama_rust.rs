@@ -261,9 +261,9 @@ impl PtraceRelationListInner {
         tracer_task: Option<TaskStructRef<'_>>,
         tracee_task: Option<TaskStructRef<'_>>,
     ) {
-        // get reference to list: safe as accesses are safe
+        // get reference to list: safe as methods are safe
         // even with concurrent mutable access to list
-        let list = unsafe { &mut *self.list.get() };
+        let list = unsafe { &*self.list.get() };
         // enter RCU critical section
         with_rcu_read_lock(|ctx| {
             let mut marked = false;
@@ -336,7 +336,7 @@ impl PtraceRelationListInner {
             }
 
             // get reference to list: safe as accesses will be read only RCU
-            let list = unsafe { &mut *self.list.get() };
+            let list = unsafe { &*self.list.get() };
 
             // get a cursor pointing to the first element of the list
             let mut cursor = list.cursor_front_rcu(ctx);

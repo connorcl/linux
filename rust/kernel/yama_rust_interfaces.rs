@@ -591,13 +591,14 @@ pub mod rcu {
                 }
             }
 
-            pub fn cursor_front_rcu<'a>(&self, ctx: RCULockContextRef<'a>) -> RCUListCursor<'a, T> {
+            pub fn cursor_front_rcu<'a, 'b>(&'a self, ctx: RCULockContextRef<'b>) -> RCUListCursor<'a, 'b, T> {
                 RCUListCursor {
                     cur: NonNull::new(rcu_dereference(
                         &self.head as *const *mut T::EntryType as *mut *mut T::EntryType,
                         ctx,
                     )),
                     _rcu_ctx: PhantomData,
+                    _list: PhantomData,
                 }
             }
 
@@ -615,16 +616,17 @@ pub mod rcu {
                 }
             }
 
-            pub fn cursor_front_inplace_mut_rcu<'a>(
-                &self,
-                ctx: RCULockContextRef<'a>,
-            ) -> RCUListCursorInplaceMut<'a, T> {
+            pub fn cursor_front_inplace_mut_rcu<'a, 'b>(
+                &'a self,
+                ctx: RCULockContextRef<'b>,
+            ) -> RCUListCursorInplaceMut<'a, 'b, T> {
                 RCUListCursorInplaceMut {
                     cur: NonNull::new(rcu_dereference(
                         &self.head as *const *mut T::EntryType as *mut *mut T::EntryType,
                         ctx,
                     )),
                     _rcu_ctx: PhantomData,
+                    _list: PhantomData,
                 }
             }
 
@@ -678,12 +680,13 @@ pub mod rcu {
             }
         }
 
-        pub struct RCUListCursor<'a, T: RCUGetLinks + GetRCUHead> {
+        pub struct RCUListCursor<'a, 'b, T: RCUGetLinks + GetRCUHead> {
             cur: Option<NonNull<T::EntryType>>,
-            _rcu_ctx: PhantomData<&'a ()>,
+            _list: PhantomData<&'a ()>,
+            _rcu_ctx: PhantomData<&'b ()>,
         }
 
-        impl<'a, T: RCUGetLinks + GetRCUHead> RCUListCursor<'a, T> {
+        impl<'a, 'b, T: RCUGetLinks + GetRCUHead> RCUListCursor<'a, 'b, T> {
             pub fn current(&self) -> Option<&T::EntryType> {
                 Some(unsafe { &*self.cur?.as_ptr() })
             }
@@ -697,12 +700,13 @@ pub mod rcu {
             }
         }
 
-        pub struct RCUListCursorInplaceMut<'a, T: RCUGetLinks + GetRCUHead> {
+        pub struct RCUListCursorInplaceMut<'a, 'b, T: RCUGetLinks + GetRCUHead> {
             cur: Option<NonNull<T::EntryType>>,
-            _rcu_ctx: PhantomData<&'a ()>,
+            _list: PhantomData<&'a ()>,
+            _rcu_ctx: PhantomData<&'b ()>,
         }
 
-        impl<'a, T: RCUGetLinks + GetRCUHead> RCUListCursorInplaceMut<'a, T> {
+        impl<'a, 'b, T: RCUGetLinks + GetRCUHead> RCUListCursorInplaceMut<'a, 'b, T> {
             pub fn current_mut(&mut self) -> Option<*mut T::EntryType> {
                 Some(self.cur?.as_ptr())
             }
@@ -718,8 +722,6 @@ pub mod rcu {
 
         pub struct RCUListCursorMut<'a, 'b, T: RCUGetLinks + GetRCUHead> {
             cur: Option<NonNull<T::EntryType>>,
-            // only one of these cursors per list, but can coexist with
-            // regular and inplace (unsafe) cursors
             list: &'a mut RCUList<T>,
             _rcu_ctx: PhantomData<&'b ()>,
         }
