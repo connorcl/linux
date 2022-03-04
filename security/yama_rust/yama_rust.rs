@@ -272,9 +272,6 @@ impl PtraceRelationList {
         
         // enter RCU critical section
         with_rcu_read_lock(|ctx| {
-            
-            let ctx = RCULockContext::lock();
-            let ctx = ctx.get_ref();
 
             let relation_tracee = new_item.relation.get_tracee();
             
@@ -282,12 +279,17 @@ impl PtraceRelationList {
             let mut cursor = list.cursor_front_mut_rcu(ctx);
             // unwrap each element of the list in turn, moving the cursor along
             
+            let mut count = 0;
+
             while let Some(relation_node) = cursor.current() {
-                pr_info!("Loop!\n");
+                count += 1;
                 if !relation_node.invalid {
+                    pr_info!("Valid!\n");
                     // update tracer if an existing relationship is present
-                    if relation_node.relation.get_tracee() == relation_tracee {
-                        // pr_info!("Replacing relationship!\n");
+                    let t = relation_node.relation.get_tracee();
+                    pr_info!("t: {}, new relation_tracee: {}\n", t.get_ptr() as usize, relation_tracee.get_ptr() as usize);
+                    if t == relation_tracee {
+                        pr_info!("Replacing relationship!\n");
                         cursor.replace_current_rcu(new_item, ctx);
                         return;
                     }
@@ -296,7 +298,7 @@ impl PtraceRelationList {
                 cursor.move_next_rcu(ctx);
             }
 
-            // pr_info!("Adding new relationship!\n");
+            pr_info!("Adding new relationship!\n");
             // if an existing relationship wasn't found, add a new one
             
             let d = unsafe { ktime_get() };
@@ -304,7 +306,7 @@ impl PtraceRelationList {
             list.push_back_rcu(new_item, ctx);
 
             let e = unsafe { ktime_get() };
-            pr_info!("Times: {}, {}, {}, {}. Total: {}\n", b - a, c - b, d - c, e - d, e - a);
+            pr_info!("Times: {}, {}, {}, {}. Total: {}, Count: {}\n", b - a, c - b, d - c, e - d, e - a, count);
         });
     }
 
@@ -336,7 +338,7 @@ impl PtraceRelationList {
                             &relation_node.relation
                         {
                             if *t == *tracer {
-                                // pr_info!("Found match, marking relationship as invalid!\n");
+                                pr_info!("Found match, marking relationship as invalid!\n");
                                 // SAFETY: updating invalid is safe, see above
                                 unsafe {
                                     (*relation_node_ptr).invalid = true;
@@ -349,7 +351,7 @@ impl PtraceRelationList {
                     if let Some(t) = &tracee_task {
                         // SAFETY: reading current item is always safe
                         if *t == relation_node.relation.get_tracee() {
-                            // pr_info!("Found match, marking relationship as invalid!\n");
+                            pr_info!("Found match, marking relationship as invalid!\n");
                             // SAFETY: updating invalid is safe, see above
                             unsafe {
                                 (*relation_node_ptr).invalid = true;
@@ -363,7 +365,7 @@ impl PtraceRelationList {
             // pr_info!("Relationships: {}\n", count);
 
             if marked {
-                // pr_info!("Marked!\n");
+                pr_info!("Marked!\n");
                 PTRACE_RELATION_LIST_CLEANUP_WORK.schedule();
             }
         });
@@ -499,6 +501,7 @@ impl SecurityHooks for YamaRust {
     }
 
     fn task_free(task: TaskStructRef<'_>) {
+        // pr_info!("Task free!\n");
         PTRACER_RELATIONS.del_relation(Some(task.get_id()), Some(task.get_id()));
     }
 
@@ -533,6 +536,7 @@ impl SecurityHooks for YamaRust {
             } else if arg2 as i32 == -1 {
                 pr_info!("Adding tracee relationship: any tracer!\n");
                 PTRACER_RELATIONS.add_relation(PtraceRelation::AnyTracer { tracee: myself.get_id() });
+                ret = Ok(());
             } else {
                 pr_info!("Adding tracee relationship!\n");
                 match TaskStruct::from_pid(arg2 as pid_t) {
