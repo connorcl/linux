@@ -7,7 +7,6 @@ use kernel::c_str;
 use kernel::c_types::*;
 use kernel::gen_sysctl_path;
 use kernel::prelude::*;
-use kernel::spinlock_init;
 use kernel::sync::*;
 use kernel::yama_rust_interfaces::init_context::*;
 use kernel::yama_rust_interfaces::rcu::rcu_list::*;
@@ -17,7 +16,7 @@ use kernel::yama_rust_interfaces::sysctl::*;
 use kernel::yama_rust_interfaces::task::*;
 use kernel::yama_rust_interfaces::work_queue::*;
 use kernel::Error;
-use kernel::define_lsm;
+use kernel::{define_lsm, init_static_sync};
 
 define_lsm!(
     "yama_rust",
@@ -27,6 +26,10 @@ define_lsm!(
     task_free,
     task_prctl
 );
+
+init_static_sync! {
+    static PTRACE_RELATION_LIST_WRITE_LOCK: SpinLock<()> = ();
+}
 
 static PTRACE_RELATION_LIST_CLEANUP_WORK: StaticWorkStruct<PtraceRelationListCleanup> =
     StaticWorkStruct::new();
@@ -38,7 +41,7 @@ static PTRACE_SCOPE: SysctlInt<PtraceScopeSysctlIntHooks> = SysctlInt::new(
     gen_sysctl_path!("kernel", "yama"),
 );
 
-static PTRACER_RELATIONS: PtraceRelationListOuter = PtraceRelationListOuter::new();
+static PTRACER_RELATIONS: PtraceRelationList = PtraceRelationList::new();
 
 struct PtraceRelationListCleanup;
 
@@ -140,21 +143,22 @@ impl SysctlIntHooks for PtraceScopeSysctlIntHooks {
     }
 }
 
+#[derive(Copy, Clone)]
 enum PtraceRelation {
     AnyTracer {
-        tracee: TaskStruct,
+        tracee: TaskStructID,
     },
     TracerTracee {
-        tracer: TaskStruct,
-        tracee: TaskStruct,
+        tracer: TaskStructID,
+        tracee: TaskStructID,
     },
 }
 
 impl PtraceRelation {
-    fn get_tracee(&self) -> TaskStructRef<'_> {
-        match &self {
-            PtraceRelation::AnyTracer { tracee } => tracee.get_ref(),
-            PtraceRelation::TracerTracee { tracer: _, tracee } => tracee.get_ref(),
+    fn get_tracee(&self) -> TaskStructID {
+        match self {
+            PtraceRelation::AnyTracer { tracee } => *tracee,
+            PtraceRelation::TracerTracee { tracer: _, tracee } => *tracee,
         }
     }
 }
@@ -178,6 +182,27 @@ impl PtraceRelationNode {
             links: RCULinks::new(),
         };
     }
+
+    fn matches_tracee(&self, tracer_task: TaskStructRef<'_>, tracee_task: TaskStructRef<'_>, ctx: RCULockContextRef<'_>) -> bool {
+        if !self.invalid {
+            match self.relation {
+                PtraceRelation::AnyTracer { tracee } => {
+                    if tracee_task.get_id() == tracee {
+                        return true
+                    }
+                },
+                PtraceRelation::TracerTracee { tracer, tracee } => {
+                    if tracee_task.get_id() == tracee {
+                        let tmp_tracer_ref = unsafe {
+                            tracer.get_tmp_ref(ctx)
+                        };
+                        return tmp_tracer_ref.is_descendant(tracer_task, ctx);
+                    }
+                }
+            }
+        }
+        return false
+    }
 }
 
 impl GetRCUHead for PtraceRelationNode {
@@ -194,17 +219,21 @@ impl RCUGetLinks for PtraceRelationNode {
     }
 }
 
-struct PtraceRelationListInner {
-    // list
+struct PtraceRelationList {
     list: UnsafeCell<RCUList<PtraceRelationNode>>,
-    // spinlock synchronizing write access to list
-    lock: Pin<Box<SpinLock<()>>>,
 }
 
-impl PtraceRelationListInner {
+unsafe impl Sync for PtraceRelationList { }
+
+impl PtraceRelationList {
+
+    pub(crate) const fn new() -> PtraceRelationList {
+        PtraceRelationList { list: UnsafeCell::new(RCUList::new()) }
+    }
+
     pub(crate) fn cleanup_relations(&self) {
         // lock spinlock to synchronize mutable access to list
-        let _lock = (*self.lock).lock();
+        let _lock = PTRACE_RELATION_LIST_WRITE_LOCK.lock();
         // get reference to list: safe as lock is held
         let list = unsafe { &mut *self.list.get() };
         // enter RCU critical section
@@ -215,10 +244,8 @@ impl PtraceRelationListInner {
             while let Some(relation) = cursor.current() {
                 // check if the relation is invalid and remove if so
                 if relation.invalid {
-                    // this returns a Box, meaning the underlying element is deallocated
-                    // once the Box goes out of scope
                     pr_info!("Removing invalid relationship!\n");
-                    cursor.remove_current_rcu(ctx)
+                    cursor.remove_current_rcu(ctx);
                 } else {
                     cursor.move_next_rcu(ctx);
                 }
@@ -227,39 +254,64 @@ impl PtraceRelationListInner {
     }
 
     pub(crate) fn add_relation(&self, relation: PtraceRelation) {
+        
+        let a = unsafe { ktime_get() };
+
         // lock spinlock to synchronize mutable access to list
-        let _lock = (*self.lock).lock();
+        let _lock  = PTRACE_RELATION_LIST_WRITE_LOCK.lock();
+        
         // get reference to list: safe as lock is held
         let list = unsafe { &mut *self.list.get() };
+
+        let b = unsafe { ktime_get() };
+
         // allocate memory for new item
         let new_item = Box::try_new(PtraceRelationNode::new(relation, false)).unwrap();
+        
+        let c = unsafe { ktime_get() };
+        
         // enter RCU critical section
         with_rcu_read_lock(|ctx| {
+            
+            let ctx = RCULockContext::lock();
+            let ctx = ctx.get_ref();
+
             let relation_tracee = new_item.relation.get_tracee();
+            
             // get a cursor pointing to the first element of the list
             let mut cursor = list.cursor_front_mut_rcu(ctx);
             // unwrap each element of the list in turn, moving the cursor along
+            
             while let Some(relation_node) = cursor.current() {
+                pr_info!("Loop!\n");
                 if !relation_node.invalid {
                     // update tracer if an existing relationship is present
                     if relation_node.relation.get_tracee() == relation_tracee {
-                        pr_info!("Replacing relationship!\n");
+                        // pr_info!("Replacing relationship!\n");
                         cursor.replace_current_rcu(new_item, ctx);
                         return;
                     }
                 }
+                
                 cursor.move_next_rcu(ctx);
             }
-            pr_info!("Adding new relationship!\n");
+
+            // pr_info!("Adding new relationship!\n");
             // if an existing relationship wasn't found, add a new one
+            
+            let d = unsafe { ktime_get() };
+            
             list.push_back_rcu(new_item, ctx);
+
+            let e = unsafe { ktime_get() };
+            pr_info!("Times: {}, {}, {}, {}. Total: {}\n", b - a, c - b, d - c, e - d, e - a);
         });
     }
 
     pub(crate) fn del_relation(
         &self,
-        tracer_task: Option<TaskStructRef<'_>>,
-        tracee_task: Option<TaskStructRef<'_>>,
+        tracer_task: Option<TaskStructID>,
+        tracee_task: Option<TaskStructID>,
     ) {
         // get reference to list: safe as methods are safe
         // even with concurrent mutable access to list
@@ -283,8 +335,8 @@ impl PtraceRelationListInner {
                         if let PtraceRelation::TracerTracee { tracer, tracee: _ } =
                             &relation_node.relation
                         {
-                            if *t == (*tracer).get_ref() {
-                                pr_info!("Found match, marking relationship as invalid!\n");
+                            if *t == *tracer {
+                                // pr_info!("Found match, marking relationship as invalid!\n");
                                 // SAFETY: updating invalid is safe, see above
                                 unsafe {
                                     (*relation_node_ptr).invalid = true;
@@ -297,11 +349,12 @@ impl PtraceRelationListInner {
                     if let Some(t) = &tracee_task {
                         // SAFETY: reading current item is always safe
                         if *t == relation_node.relation.get_tracee() {
-                            pr_info!("Found match, marking relationship as invalid!\n");
+                            // pr_info!("Found match, marking relationship as invalid!\n");
                             // SAFETY: updating invalid is safe, see above
                             unsafe {
                                 (*relation_node_ptr).invalid = true;
                             }
+                            marked = true;
                         }
                     }
                 }
@@ -310,6 +363,7 @@ impl PtraceRelationListInner {
             // pr_info!("Relationships: {}\n", count);
 
             if marked {
+                // pr_info!("Marked!\n");
                 PTRACE_RELATION_LIST_CLEANUP_WORK.schedule();
             }
         });
@@ -342,116 +396,14 @@ impl PtraceRelationListInner {
             let mut cursor = list.cursor_front_rcu(ctx);
             // unwrap each element of the list in turn, moving the cursor along
             while let Some(relation_node) = cursor.current() {
-                if !relation_node.invalid {
-                    if relation_node.relation.get_tracee() == tracee_task {
-                        match &relation_node.relation {
-                            PtraceRelation::AnyTracer { tracee: _ } => {
-                                return true;
-                            }
-                            PtraceRelation::TracerTracee { tracer, tracee: _ } => {
-                                if tracer.get_ref().is_descendant(tracer_task) {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
+                if relation_node.matches_tracee(tracer_task, tracee_task, ctx) {
+                    return true;
                 }
                 cursor.move_next_rcu(ctx);
             }
 
             return false;
         })
-    }
-}
-
-enum PtraceRelationList {
-    Initialized { inner: PtraceRelationListInner },
-    Uninitialized,
-}
-
-impl PtraceRelationList {
-    pub(crate) fn new_init() -> PtraceRelationList {
-        let mut list = PtraceRelationList::Initialized {
-            inner: PtraceRelationListInner {
-                list: UnsafeCell::new(RCUList::new()),
-                lock: Pin::from(Box::try_new(unsafe { SpinLock::new(()) }).unwrap()),
-            },
-        };
-        if let PtraceRelationList::Initialized { ref mut inner } = list {
-            spinlock_init!(inner.lock.as_mut(), "a::b::C");
-        }
-        list
-    }
-}
-
-struct PtraceRelationListOuter {
-    list: InitCell<PtraceRelationList>,
-}
-
-unsafe impl Sync for PtraceRelationListOuter {}
-
-impl PtraceRelationListOuter {
-    pub(crate) const fn new() -> PtraceRelationListOuter {
-        PtraceRelationListOuter {
-            list: InitCell::new(PtraceRelationList::Uninitialized),
-        }
-    }
-
-    // must not be run concurrently with any other methods
-    #[link_section = ".init.text"]
-    pub(crate) unsafe fn init(&self, init_ctx: InitContextRef<'_>) {
-        let r = unsafe { &mut *self.list.get(init_ctx) };
-
-        if let PtraceRelationList::Uninitialized = r {
-            *r = PtraceRelationList::new_init();
-        }
-    }
-
-    pub(crate) fn if_initialized<R, F: FnOnce(&PtraceRelationListInner) -> R>(
-        &self,
-        f: F,
-    ) -> Result<R> {
-        // safe assuming init cannot be called concurrently
-        let list = self.list.get_ref();
-        if let PtraceRelationList::Initialized { inner } = list {
-            Ok(f(inner))
-        } else {
-            Err(Error::EINVAL)
-        }
-    }
-
-    pub(crate) fn cleanup_relations(&self) {
-        self.if_initialized(|inner| {
-            inner.cleanup_relations();
-        })
-        .unwrap();
-    }
-
-    pub(crate) fn add_relation(&self, relation: PtraceRelation) {
-        self.if_initialized(|inner| {
-            inner.add_relation(relation);
-        })
-        .unwrap();
-    }
-
-    pub(crate) fn del_relation(
-        &self,
-        tracer_task: Option<TaskStructRef<'_>>,
-        tracee_task: Option<TaskStructRef<'_>>,
-    ) {
-        self.if_initialized(|inner| {
-            inner.del_relation(tracer_task, tracee_task);
-        })
-        .unwrap();
-    }
-
-    pub(crate) fn exception_found(
-        &self,
-        tracer_task: TaskStructRef<'_>,
-        tracee_task: TaskStructRef<'_>,
-    ) -> bool {
-        self.if_initialized(|inner| inner.exception_found(tracer_task, tracee_task))
-            .unwrap()
     }
 }
 
@@ -476,10 +428,10 @@ impl SecurityHooks for YamaRust {
                         let is_descendant = TaskStruct::current()
                             .unwrap()
                             .get_ref()
-                            .is_descendant(child);
+                            .is_descendant(child, ctx);
                         let exception_found = PTRACER_RELATIONS.exception_found(
                             TaskStruct::current().unwrap().get_ref(),
-                            child.clone(),
+                            child,
                         );
                         let has_capability = child.current_ns_capable(CAP_SYS_PTRACE, ctx);
                         pr_info!(
@@ -547,7 +499,7 @@ impl SecurityHooks for YamaRust {
     }
 
     fn task_free(task: TaskStructRef<'_>) {
-        PTRACER_RELATIONS.del_relation(Some(task.clone()), Some(task.clone()));
+        PTRACER_RELATIONS.del_relation(Some(task.get_id()), Some(task.get_id()));
     }
 
     fn task_prctl(
@@ -576,18 +528,18 @@ impl SecurityHooks for YamaRust {
             // no tracing permitted
             if arg2 == 0 {
                 pr_info!("Removing tracee relationship!\n");
-                PTRACER_RELATIONS.del_relation(None, Some(myself.get_ref()));
+                PTRACER_RELATIONS.del_relation(None, Some(myself.get_id()));
                 ret = Ok(());
             } else if arg2 as i32 == -1 {
                 pr_info!("Adding tracee relationship: any tracer!\n");
-                PTRACER_RELATIONS.add_relation(PtraceRelation::AnyTracer { tracee: myself });
+                PTRACER_RELATIONS.add_relation(PtraceRelation::AnyTracer { tracee: myself.get_id() });
             } else {
                 pr_info!("Adding tracee relationship!\n");
                 match TaskStruct::from_pid(arg2 as pid_t) {
                     Some(t) => {
                         PTRACER_RELATIONS.add_relation(PtraceRelation::TracerTracee {
-                            tracer: t,
-                            tracee: myself,
+                            tracer: t.get_id(),
+                            tracee: myself.get_id(),
                         });
                         ret = Ok(());
                     }
@@ -609,9 +561,9 @@ impl SecurityModule for YamaRust {
 
         // SAFETY: exclusive write access from this init function,
         // and no read accesses as hooks have not been registered
-        unsafe {
-            PTRACER_RELATIONS.init(init_ctx);
-        }
+        // unsafe {
+        //     PTRACER_RELATIONS.init(init_ctx);
+        // }
 
         // SAFETY: exclusive write access from this init function,
         // and no read accesses as hooks have not been registered

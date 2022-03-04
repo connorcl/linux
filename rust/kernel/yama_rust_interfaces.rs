@@ -377,13 +377,13 @@ pub mod rcu {
     use core::marker::PhantomData;
 
     // ZST struct to represent RCU lock context
-    struct RCULockContext {
+    pub struct RCULockContext {
         // private field prevents direct construction
         _private: (),
     }
 
     impl RCULockContext {
-        pub(crate) fn lock() -> RCULockContext {
+        pub fn lock() -> RCULockContext {
             unsafe {
                 rcu_read_lock_exported();
             }
@@ -393,7 +393,7 @@ pub mod rcu {
         // get a zero-size 'reference' type that behaves as if
         // if holds a reference to self, enforcing that this reference
         // does not outlive self
-        pub(crate) fn get_ref<'a>(&'a self) -> RCULockContextRef<'a> {
+        pub fn get_ref<'a>(&'a self) -> RCULockContextRef<'a> {
             RCULockContextRef {
                 _phantom: PhantomData,
             }
@@ -444,7 +444,7 @@ pub mod rcu {
             let callback: rcu_callback_t = unsafe { Some(core::mem::transmute(rcu_head_offset)) };
             unsafe {
                 // set callback to free memory
-                call_rcu(rcu_head_ptr, callback);
+                kvfree_call_rcu(rcu_head_ptr, callback);
             }
         }
     }
@@ -585,7 +585,7 @@ pub mod rcu {
         }
 
         impl<T: RCUGetLinks + GetRCUHead> RCUList<T> {
-            pub fn new() -> RCUList<T> {
+            pub const fn new() -> RCUList<T> {
                 RCUList {
                     head: core::ptr::null_mut(),
                 }
@@ -620,6 +620,7 @@ pub mod rcu {
                 &'a self,
                 ctx: RCULockContextRef<'b>,
             ) -> RCUListCursorInplaceMut<'a, 'b, T> {
+                // crate::pr_info!("head: {}\n", self.head as usize);
                 RCUListCursorInplaceMut {
                     cur: NonNull::new(rcu_dereference(
                         &self.head as *const *mut T::EntryType as *mut *mut T::EntryType,
@@ -642,6 +643,7 @@ pub mod rcu {
                 match head {
                     // if the list is not empty
                     Some(p) => {
+                        // crate::pr_info!("List not empty!\n");
                         unsafe {
                             // get list entry for head
                             let ptr_to_head_list_entry = T::get_links(&mut *p.as_ptr()).entry.get();
@@ -663,6 +665,7 @@ pub mod rcu {
                     }
                     // if list is empty
                     None => {
+                        // crate::pr_info!("List empty!\n");
                         unsafe {
                             // set up next pointer to be null
                             (*ptr_to_new_list_entry).next = core::ptr::null_mut();
@@ -891,6 +894,10 @@ pub mod task {
                 _marker: PhantomData,
             }
         }
+
+        pub fn get_id(&self) -> TaskStructID {
+            TaskStructID { ptr: self.ptr }
+        }
     }
 
     impl Drop for TaskStruct {
@@ -898,6 +905,28 @@ pub mod task {
             unsafe {
                 put_task_struct_exported(self.ptr.as_ptr());
             }
+        }
+    }
+
+    #[derive(Copy, Clone)]
+    pub struct TaskStructID {
+        ptr: NonNull<task_struct>,
+    }
+
+    impl TaskStructID {
+        // get a task struct ref that is valid for rcu lock ctx
+        // caller must ensure ptr is valid throughout rcu context!
+        pub unsafe fn get_tmp_ref<'a>(&self, _ctx: RCULockContextRef<'a>) -> TaskStructRef<'a> {
+            TaskStructRef {
+                ptr: self.ptr,
+                _marker: PhantomData,
+            }
+        }
+    }
+
+    impl<'a> PartialEq for TaskStructID {
+        fn eq(&self, other: &Self) -> bool {
+            self.ptr == other.ptr
         }
     }
 
@@ -926,6 +955,10 @@ pub mod task {
 
         pub fn get_task_struct(&self) -> TaskStruct {
             TaskStruct::from_nonnull(self.ptr)
+        }
+
+        pub fn get_id(&self) -> TaskStructID {
+            TaskStructID { ptr: self.ptr }
         }
 
         pub fn pid(&self) -> pid_t {
@@ -1012,28 +1045,26 @@ pub mod task {
             }
         }
 
-        pub fn is_descendant(&self, child: TaskStructRef<'_>) -> bool {
-            with_rcu_read_lock(|ctx| {
-                let parent = if self.thread_group_leader() {
-                    *self
-                } else {
-                    self.get_thread_group_leader(ctx).unwrap()
-                };
-                let mut walker = child;
+        pub fn is_descendant(&self, child: TaskStructRef<'_>, ctx: RCULockContextRef<'_>) -> bool {
+            let parent = if self.thread_group_leader() {
+                *self
+            } else {
+                self.get_thread_group_leader(ctx).unwrap()
+            };
+            let mut walker = child;
 
-                while walker.pid() > 0 {
-                    walker = if walker.thread_group_leader() {
-                        walker
-                    } else {
-                        walker.get_thread_group_leader(ctx).unwrap()
-                    };
-                    if walker == parent {
-                        return true;
-                    }
-                    walker = walker.get_real_parent(ctx).unwrap();
+            while walker.pid() > 0 {
+                walker = if walker.thread_group_leader() {
+                    walker
+                } else {
+                    walker.get_thread_group_leader(ctx).unwrap()
+                };
+                if walker == parent {
+                    return true;
                 }
-                return false;
-            })
+                walker = walker.get_real_parent(ctx).unwrap();
+            }
+            return false;
         }
     }
 
@@ -1164,7 +1195,7 @@ pub mod work_queue {
                     task_work_notify_mode_TWA_RESUME,
                 )
             };
-            pr_info!("Task work add: {}\n", ret);
+            // crate::pr_info!("Task work add: {}\n", ret);
         }
     }
 }
@@ -1298,7 +1329,7 @@ pub mod sysctl {
                     )
                 };
                 let a = sret != core::ptr::null_mut();
-                pr_info!("Registering sysctl paths: {}\n", a);
+                // pr_info!("Registering sysctl paths: {}\n", a);
             }
         }
     }
