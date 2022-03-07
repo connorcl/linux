@@ -214,8 +214,8 @@ impl GetRCUHead for PtraceRelationNode {
 impl RCUGetLinks for PtraceRelationNode {
     type EntryType = PtraceRelationNode;
 
-    fn get_links(data: &mut Self::EntryType) -> &mut RCULinks<Self::EntryType> {
-        &mut data.links
+    fn get_links(data: &Self::EntryType) -> &RCULinks<Self::EntryType> {
+        &data.links
     }
 }
 
