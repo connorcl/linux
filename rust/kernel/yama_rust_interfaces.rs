@@ -181,29 +181,9 @@ pub mod security_module {
     /// required for a security module. The registration of these
     /// hooks is usually facilated by the `define_lsm` macro, which
     /// takes a type implementing this trait as an argument.
-    pub trait SecurityHooks {
-        fn ptrace_access_check(_child: TaskStructRef<'_>, _mode: c_uint) -> Result {
-            return Ok(());
-        }
-
-        fn ptrace_traceme(_parent: TaskStructRef<'_>) -> Result {
-            return Ok(());
-        }
-
-        fn task_free(_task: TaskStructRef<'_>) {
-            return;
-        }
-
-        fn task_prctl(
-            _option: c_int,
-            _arg2: c_ulong,
-            _arg3: c_ulong,
-            _arg4: c_ulong,
-            _arg5: c_ulong,
-        ) -> Result {
-            return Ok(());
-        }
-    }
+    // pub trait SecurityHooks {
+        
+    // }
 
     /// A generic struct containing wrapper `extern "C"` functions for
     /// each security subsystem hook.
@@ -216,12 +196,12 @@ pub mod security_module {
     ///
     /// This type should not usually be used directly, but it is used by
     /// the `define_lsm` macro.
-    pub struct __SecurityHooks<T: SecurityHooks> {
+    pub struct SecurityHooks<T: SecurityModule> {
         // enable use of type paramter
         _phantom: PhantomData<T>,
     }
 
-    impl<T: SecurityHooks> __SecurityHooks<T> {
+    impl<T: SecurityModule> SecurityHooks<T> {
         pub unsafe extern "C" fn ptrace_access_check(
             child: *mut task_struct,
             mode: c_uint,
@@ -273,14 +253,37 @@ pub mod security_module {
     }
 
     pub trait SecurityModule {
+
         fn init(hooks: &mut SecurityHookList, init_ctx: InitContextRef<'_>) -> Result;
+    
+        fn ptrace_access_check(_child: TaskStructRef<'_>, _mode: c_uint) -> Result {
+            return Ok(());
+        }
+
+        fn ptrace_traceme(_parent: TaskStructRef<'_>) -> Result {
+            return Ok(());
+        }
+
+        fn task_free(_task: TaskStructRef<'_>) {
+            return;
+        }
+
+        fn task_prctl(
+            _option: c_int,
+            _arg2: c_ulong,
+            _arg3: c_ulong,
+            _arg4: c_ulong,
+            _arg5: c_ulong,
+        ) -> Result {
+            return Ok(());
+        }
     }
 
-    pub struct DefineLSMTraitBoundCheck<T: SecurityHooks + SecurityModule> {
+    pub struct DefineLSMTraitBoundCheck<T: SecurityModule> {
         _phantom: PhantomData<T>,
     }
 
-    impl<T: SecurityHooks + SecurityModule> DefineLSMTraitBoundCheck<T> {
+    impl<T: SecurityModule> DefineLSMTraitBoundCheck<T> {
         pub const fn new() -> DefineLSMTraitBoundCheck<T> {
             return DefineLSMTraitBoundCheck {
                 _phantom: PhantomData,
@@ -319,7 +322,7 @@ pub mod security_module {
                         head: unsafe { &security_hook_heads.$x as *const _ as *mut _ },
                         // hook function itself
                         hook: security_list_options {
-                            $x: Some(__SecurityHooks::<$a>::$x),
+                            $x: Some(SecurityHooks::<$a>::$x),
                         },
                         // other items initialized with default values (null pointers)
                         list: hlist_node {
@@ -643,7 +646,7 @@ pub mod rcu {
                 match head {
                     // if the list is not empty
                     Some(p) => {
-                        crate::pr_info!("Push back head: {}\n", p.as_ptr() as usize);
+                        // crate::pr_info!("Push back head: {}\n", p.as_ptr() as usize);
                         // crate::pr_info!("List not empty!\n");
                         unsafe {
                             // get list entry for head
@@ -660,7 +663,7 @@ pub mod rcu {
                                 ptr_to_head_prev
                             };
 
-                            crate::pr_info!("Push back tail: {}\n", ptr_to_tail_item as usize);
+                            // crate::pr_info!("Push back tail: {}\n", ptr_to_tail_item as usize);
                             // get tail links
                             let tail_links = T::get_links(&mut *ptr_to_tail_item);
 
@@ -682,6 +685,67 @@ pub mod rcu {
                             // set up next pointer to be null
                             (*ptr_to_new_list_entry).next = core::ptr::null_mut();
                             // set up prev pointer to point to itself (tail)
+                            (*ptr_to_new_list_entry).prev = core::ptr::null_mut();
+                            // rcu_assign to the list's head pointer
+                            rcu_assign_pointer(
+                                &mut self.head as *mut *mut T::EntryType,
+                                ptr_to_new_item,
+                                ctx,
+                            );
+                        }
+                    }
+                }
+            }
+
+            pub fn push_front_rcu(&mut self, new: Box<T::EntryType>, ctx: RCULockContextRef<'_>) {
+                // get head ptr
+                let head = NonNull::new(self.head);
+                // convert box to raw pointer to prevent drop
+                let ptr_to_new_item = Box::into_raw(new);
+                // get list entry for new item
+                let ptr_to_new_list_entry =
+                    unsafe { T::get_links(&mut *ptr_to_new_item).entry.get() };
+
+                match head {
+                    // if the list is not empty
+                    Some(p) => {
+                        // crate::pr_info!("Push back head: {}\n", p.as_ptr() as usize);
+                        // crate::pr_info!("List not empty!\n");
+                        unsafe {
+                            // get list entry for head
+                            let ptr_to_head_list_entry = T::get_links(&mut *p.as_ptr()).entry.get();
+                           
+                            // get prev pointer of head item
+                            let ptr_to_head_prev = (*ptr_to_head_list_entry).prev;
+                            // calculate the new tail ptr
+                            let ptr_to_tail_item = if ptr_to_head_prev == core::ptr::null_mut() {
+                                // if current head's prev is null, new tail will be current head
+                                p.as_ptr()
+                            } else {
+                                // otherwise, tail item is head prev
+                                (*ptr_to_head_list_entry).prev
+                            };
+                            // set prev and next ptrs for current item
+                            (*ptr_to_new_list_entry).prev = ptr_to_tail_item;
+                            (*ptr_to_new_list_entry).next = p.as_ptr();
+
+                            // rcu_assign to the list's head pointer
+                            rcu_assign_pointer(
+                                &mut self.head as *mut *mut T::EntryType,
+                                ptr_to_new_item,
+                                ctx,
+                            );
+                            // update head's prev pointer
+                            (*ptr_to_head_list_entry).prev = ptr_to_new_item;
+                        }
+                    }
+                    // if list is empty
+                    None => {
+                        // crate::pr_info!("List empty!\n");
+                        unsafe {
+                            // set up next pointer to be null
+                            (*ptr_to_new_list_entry).next = core::ptr::null_mut();
+                            // set up prev pointer to be null
                             (*ptr_to_new_list_entry).prev = core::ptr::null_mut();
                             // rcu_assign to the list's head pointer
                             rcu_assign_pointer(
@@ -786,6 +850,13 @@ pub mod rcu {
                             let prev_list_links = T::get_links(&mut *ptr_to_prev_item);
                             // rcu_assign next pointer for prev item
                             prev_list_links.rcu_assign_next(ptr_to_next_item, ctx);
+                            // get head list entry
+                            let ptr_to_head_list_entry = T::get_links(&mut *self.list.head).entry.get();
+                            // if head->prev points to current item
+                            if (*ptr_to_head_list_entry).prev == p.as_ptr() {
+                                // update head->prev to point to prev item
+                                (*ptr_to_head_list_entry).prev = ptr_to_prev_item;
+                            }
                         }
 
                         // update self.cur
@@ -813,10 +884,10 @@ pub mod rcu {
 
                         // get pointer to prev item
                         let ptr_to_prev_item = (*ptr_to_cur_list_entry).prev;
-                        crate::pr_info!("Ptr to prev: {}\n", ptr_to_prev_item as usize);
+                        // crate::pr_info!("Ptr to prev: {}\n", ptr_to_prev_item as usize);
                         // get pointer to next item
                         let ptr_to_next_item = (*ptr_to_cur_list_entry).next;
-                        crate::pr_info!("Ptr to next: {}\n", ptr_to_next_item as usize);
+                        // crate::pr_info!("Ptr to next: {}\n", ptr_to_next_item as usize);
 
                         // set next and prev pointers for new item
                         (*ptr_to_new_list_entry).prev = ptr_to_prev_item;
@@ -824,23 +895,30 @@ pub mod rcu {
 
                         // if this item is the list head, i.e. prev points to tail
                         if p.as_ptr() == self.list.head {
-                            crate::pr_info!("Ptr to list head: {}\n", self.list.head as usize);
+                            // crate::pr_info!("Ptr to list head: {}\n", self.list.head as usize);
                             // rcu_assign the list's head pointer
                             rcu_assign_pointer(
                                 &mut self.list.head as *mut *mut T::EntryType,
                                 ptr_to_new_item,
                                 ctx,
                             );
-                            crate::pr_info!("Ptr to list head: {}\n", self.list.head as usize);
-                            let ptr_to_new_list_entry = T::get_links(&mut *ptr_to_new_item).entry.get();
-                            crate::pr_info!("prev 2: {}\n", (*ptr_to_new_list_entry).prev as usize);
-                            crate::pr_info!("next 2: {}\n", (*ptr_to_new_list_entry).next as usize)
+                            // crate::pr_info!("Ptr to list head: {}\n", self.list.head as usize);
+                            // let ptr_to_new_list_entry = T::get_links(&mut *ptr_to_new_item).entry.get();
+                            // crate::pr_info!("prev 2: {}\n", (*ptr_to_new_list_entry).prev as usize);
+                            // crate::pr_info!("next 2: {}\n", (*ptr_to_new_list_entry).next as usize)
                         } else {
                             // get previous item's links
                             let prev_list_links = T::get_links(&mut *ptr_to_prev_item);
                             // rcu-assign next pointer for prev item
                             prev_list_links.rcu_assign_next(ptr_to_new_item, ctx);
-                            crate::pr_info!("Prev next: {}\n", (*prev_list_links.entry.get()).next as usize);
+                            // crate::pr_info!("Prev next: {}\n", (*prev_list_links.entry.get()).next as usize);
+                            // get head list entry
+                            let ptr_to_head_list_entry = T::get_links(&mut *self.list.head).entry.get();
+                            // if head->prev points to current item
+                            if (*ptr_to_head_list_entry).prev == p.as_ptr() {
+                                // update head->prev to point to new item
+                                (*ptr_to_head_list_entry).prev = ptr_to_new_item;
+                            }
                         }
 
                         // set prev pointer for next item
@@ -848,14 +926,6 @@ pub mod rcu {
                             let ptr_to_next_entry =
                                 T::get_links(&mut *ptr_to_next_item).entry.get();
                             (*ptr_to_next_entry).prev = ptr_to_new_item;
-                        }
-
-                        // get head list entry
-                        let ptr_to_head_list_entry = T::get_links(&mut *self.list.head).entry.get();
-                        // if head->prev points to current item
-                        if (*ptr_to_head_list_entry).prev == p.as_ptr() {
-                           // update head->prev to point to new item
-                           (*ptr_to_head_list_entry).prev = ptr_to_new_item;
                         }
 
                         // update self.cur
