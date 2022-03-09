@@ -279,17 +279,17 @@ impl PtraceRelationList {
             let mut cursor = list.cursor_front_mut_rcu(ctx);
             // unwrap each element of the list in turn, moving the cursor along
             
-            // let mut count = 0;
+            let mut count = 0;
 
             while let Some(relation_node) = cursor.current() {
-                // count += 1;
+                count += 1;
                 if !relation_node.invalid {
-                    // pr_info!("Valid!\n");
+                    pr_info!("Valid!\n");
                     // update tracer if an existing relationship is present
                     let t = relation_node.relation.get_tracee();
                     // pr_info!("t: {}, new relation_tracee: {}\n", t.get_ptr() as usize, relation_tracee.get_ptr() as usize);
                     if t == relation_tracee {
-                        // pr_info!("Replacing relationship! count: {}\n", count);
+                        pr_info!("Replacing relationship! count: {}\n", count);
                         cursor.replace_current_rcu(new_item, ctx);
                         return;
                     }
@@ -298,7 +298,7 @@ impl PtraceRelationList {
                 cursor.move_next_rcu(ctx);
             }
 
-            // pr_info!("Adding new relationship! count: {}\n", count);
+            pr_info!("Adding new relationship! count: {}\n", count);
             // if an existing relationship wasn't found, add a new one
             
             // let d = unsafe { ktime_get() };
@@ -341,7 +341,7 @@ impl PtraceRelationList {
                             &relation_node.relation
                         {
                             if *t == *tracer {
-                                // pr_info!("Found match, marking relationship as invalid!\n");
+                                pr_info!("Found match, marking relationship as invalid!\n");
                                 // SAFETY: updating invalid is safe, see above
                                 unsafe {
                                     (*relation_node_ptr).invalid = true;
@@ -354,7 +354,7 @@ impl PtraceRelationList {
                     if let Some(t) = &tracee_task {
                         // SAFETY: reading current item is always safe
                         if *t == relation_node.relation.get_tracee() {
-                            // pr_info!("Found match, marking relationship as invalid!\n");
+                            pr_info!("Found match, marking relationship as invalid!\n");
                             // SAFETY: updating invalid is safe, see above
                             unsafe {
                                 (*relation_node_ptr).invalid = true;
@@ -568,7 +568,7 @@ impl SecurityModule for YamaRust {
     }
 
     #[link_section = ".init.text"]
-    fn init(hooks: &mut SecurityHookList, init_ctx: InitContextRef<'_>) -> Result {
+    fn init(hooks: &'static mut SecurityHookList, init_ctx: InitContextRef<'_>) -> Result {
         pr_info!("Initializing Yama-Rust!\n");
 
         // SAFETY: exclusive write access from this init function,
@@ -577,8 +577,8 @@ impl SecurityModule for YamaRust {
             PTRACE_RELATION_LIST_CLEANUP_WORK.init(init_ctx);
         }
 
-        // SAFETY: there is no other access to hooks array
-        let ret = unsafe { hooks.register(init_ctx) };
+        // SAFETY: register() is being called during initialization
+        unsafe { hooks.register(init_ctx) };
 
         // SAFETY: exclusive write access from this init function,
         // and no read accesses until the next line (register)
@@ -588,15 +588,17 @@ impl SecurityModule for YamaRust {
 
         PTRACE_SCOPE.register();
 
-        match ret {
-            Ok(_) => {
-                pr_info!("Hooks registered successfully!\n");
-                return Ok(());
-            }
-            Err(e) => {
-                pr_info!("Error registering hooks: {}\n", e.to_kernel_errno());
-                return Err(e);
-            }
-        }
+        // match ret {
+        //     Ok(_) => {
+        //         pr_info!("Hooks registered successfully!\n");
+        //         return Ok(());
+        //     }
+        //     Err(e) => {
+        //         pr_info!("Error registering hooks: {}\n", e.to_kernel_errno());
+        //         return Err(e);
+        //     }
+        // }
+
+        Ok(())
     }
 }

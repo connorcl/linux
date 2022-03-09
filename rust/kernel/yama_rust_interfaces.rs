@@ -157,21 +157,20 @@ pub mod security_module {
         ///
         /// This method should not be called concurrently, and there should
         /// be no concurrent access to the raw list of security hooks
-        /// referred to by the underlyinf type. If the `define_lsm` macro is used,
+        /// referred to by the underlying type. If the `define_lsm` macro is used,
         /// and this method only called within the security module `init` method,
         /// these conditions should be satisfied.
         #[link_section = ".init.text"]
-        pub unsafe fn register(&mut self, _init_ctx: InitContextRef<'_>) -> Result {
+        pub unsafe fn register(&'static mut self, _init_ctx: InitContextRef<'_>) {
             let hooks_ptr = self.hook_list.as_mut_ptr();
             let hooks_len = self.hook_list.len() as c_int;
             let name_ptr = self.lsm_name.as_char_ptr();
-            // SAFETY: FFI call, internal refs are 'static so pointers will remain valid.
-            // No race conditions assuming specified preconditions hold
+            // SAFETY: internal refs are 'static so are guaranteed to 
+            // remain valid, and self is 'static so referenced data in
+            // struct fields cannot be unsafely accessed later
             unsafe {
                 security_add_hooks(hooks_ptr, hooks_len, name_ptr as *mut c_char);
             }
-
-            return Ok(());
         }
     }
 
@@ -209,10 +208,10 @@ pub mod security_module {
             let child = unsafe { TaskStructRef::from_ptr(&child).unwrap() };
             match T::ptrace_access_check(child, mode) {
                 Ok(_) => {
-                    return 0;
+                    0
                 }
                 Err(e) => {
-                    return e.to_kernel_errno();
+                    e.to_kernel_errno()
                 }
             }
         }
@@ -221,10 +220,10 @@ pub mod security_module {
             let parent = unsafe { TaskStructRef::from_ptr(&parent).unwrap() };
             match T::ptrace_traceme(parent) {
                 Ok(_) => {
-                    return 0;
+                    0
                 }
                 Err(e) => {
-                    return e.to_kernel_errno();
+                    e.to_kernel_errno()
                 }
             }
         }
@@ -243,10 +242,10 @@ pub mod security_module {
         ) -> c_int {
             match T::task_prctl(option, arg2, arg3, arg4, arg5) {
                 Ok(_) => {
-                    return 0;
+                    0
                 }
                 Err(e) => {
-                    return e.to_kernel_errno();
+                    e.to_kernel_errno()
                 }
             }
         }
@@ -254,19 +253,17 @@ pub mod security_module {
 
     pub trait SecurityModule {
 
-        fn init(hooks: &mut SecurityHookList, init_ctx: InitContextRef<'_>) -> Result;
+        fn init(hooks: &'static mut SecurityHookList, init_ctx: InitContextRef<'_>) -> Result;
     
         fn ptrace_access_check(_child: TaskStructRef<'_>, _mode: c_uint) -> Result {
-            return Ok(());
+            Ok(())
         }
 
         fn ptrace_traceme(_parent: TaskStructRef<'_>) -> Result {
-            return Ok(());
+            Ok(())
         }
 
-        fn task_free(_task: TaskStructRef<'_>) {
-            return;
-        }
+        fn task_free(_task: TaskStructRef<'_>) { }
 
         fn task_prctl(
             _option: c_int,
@@ -275,19 +272,7 @@ pub mod security_module {
             _arg4: c_ulong,
             _arg5: c_ulong,
         ) -> Result {
-            return Ok(());
-        }
-    }
-
-    pub struct DefineLSMTraitBoundCheck<T: SecurityModule> {
-        _phantom: PhantomData<T>,
-    }
-
-    impl<T: SecurityModule> DefineLSMTraitBoundCheck<T> {
-        pub const fn new() -> DefineLSMTraitBoundCheck<T> {
-            return DefineLSMTraitBoundCheck {
-                _phantom: PhantomData,
-            };
+            Ok(())
         }
     }
 
@@ -300,10 +285,13 @@ pub mod security_module {
 
     #[macro_export]
     macro_rules! define_lsm {
-        ( $name:literal, $a:ty, $( $x:ident ),+ ) => {
-
+        ( $name:literal, $security_module:ty, $( $security_hook:ident ),+ ) => {
             // generates a clear error if trait bounds are not satisfied for $a
-            static __define_lsm_trait_bound_check: DefineLSMTraitBoundCheck<$a> = DefineLSMTraitBoundCheck::new();
+            struct DefineLSMTraitBoundCheck<T: SecurityModule> {
+                _marker: core::marker::PhantomData<T>,
+            }
+            static __define_lsm_trait_bound_check: DefineLSMTraitBoundCheck<$security_module> =
+                DefineLSMTraitBoundCheck { _marker: core::marker::PhantomData };
 
             // variable (not constant) containing LSM name as required by C interfaces
             static __LSM_NAME: &'static $crate::str::CStr = $crate::c_str!($name);
@@ -311,7 +299,7 @@ pub mod security_module {
             // log prefix for kernel print
             const __LOG_PREFIX: &[u8] = $crate::c_str!($name).as_bytes_with_nul();
 
-            const i: usize = kernel::count!($($x)*);
+            const i: usize = kernel::count!($($security_hook)*);
 
             // the raw list of security hooks
             static mut __lsm_hooks_raw: [security_hook_list; i] = [
@@ -319,10 +307,10 @@ pub mod security_module {
                     security_hook_list {
                         // hook location: bprm_check_security
                         // SAFETY: pointer to be used in C, *mut required
-                        head: unsafe { &security_hook_heads.$x as *const _ as *mut _ },
+                        head: unsafe { &security_hook_heads.$security_hook as *const _ as *mut _ },
                         // hook function itself
                         hook: security_list_options {
-                            $x: Some(SecurityHooks::<$a>::$x),
+                            $security_hook: Some(SecurityHooks::<$security_module>::$security_hook),
                         },
                         // other items initialized with default values (null pointers)
                         list: hlist_node {
@@ -345,13 +333,13 @@ pub mod security_module {
             #[link_section = ".init.text"]
             unsafe extern "C" fn __lsm_init_fn() -> c_int {
                 let init_ctx = unsafe { InitContext::new() };
-                let ret = unsafe { <$a>::init(&mut __lsm_hooks, init_ctx.get_ref()) };
+                let ret = unsafe { <$security_module>::init(&mut __lsm_hooks, init_ctx.get_ref()) };
                 match ret {
                     Ok(_) => {
-                        return 0;
+                        0
                     },
                     Err(e) => {
-                        return e.to_kernel_errno();
+                        e.to_kernel_errno()
                     }
                 }
             }
