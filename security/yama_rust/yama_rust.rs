@@ -3,7 +3,7 @@ use kernel::bindings::*;
 use kernel::c_types::*;
 use kernel::Error;
 use kernel::yama_rust_interfaces::*;
-use kernel::{define_lsm, count};
+use kernel::{define_lsm, count, init_static_sync};
 use core::convert::TryInto;
 use core::ptr::null_mut;
 use kernel::sync::*;
@@ -21,7 +21,7 @@ const YAMA_RUST_SCOPE_RELATIONAL: c_int = 1;
 const YAMA_RUST_SCOPE_CAPABILITY: c_int = 2;
 const YAMA_RUST_SCOPE_NO_ATTACH: c_int = 3;
 
-static mut PTRACE_SCOPE: c_int = YAMA_RUST_SCOPE_CAPABILITY;
+static PTRACE_SCOPE: c_int = YAMA_RUST_SCOPE_CAPABILITY;
 
 struct PtraceRelation {
     pub(crate) tracer: *mut task_struct,
@@ -50,16 +50,24 @@ impl GetLinks for PtraceRelation {
 }
 
 type PtraceRelationList = List<Box<PtraceRelation>>;
-type PtraceRelationListContainer = Pin<Box<SpinLock<PtraceRelationList>>>;
+// type PtraceRelationListContainer = Pin<Box<SpinLock<PtraceRelationList>>>;
 
-static mut ptracer_relations: Option<PtraceRelationListContainer> = None;
+struct PtraceRelationListWrapper(PtraceRelationList);
+
+unsafe impl Send for PtraceRelationListWrapper { }
+
+init_static_sync! {
+    static PTRACE_RELATIONS: SpinLock<PtraceRelationListWrapper> = PtraceRelationListWrapper(PtraceRelationList::new());
+}
+
+// static mut ptracer_relations: Option<PtraceRelationListContainer> = None;
 
 unsafe fn yama_relation_cleanup() {
     unsafe {
         // mutably borrow spinlock-protected list if present
-        if let Some(ref mut p) = &mut ptracer_relations {
+        // if let Some(ref mut p) = &mut ptracer_relations {
             // lock spinlock to mutably borrow the inner list
-            let list = &mut *p.lock();
+            let list = &mut PTRACE_RELATIONS.lock().0;
             // get a cursor pointing to the first element of the list
             let mut cursor = list.cursor_front_mut();
             // unwrap each element of the list in turn, moving the cursor along
@@ -74,16 +82,16 @@ unsafe fn yama_relation_cleanup() {
                     cursor.move_next();
                 }
             }
-        }
+        // }
     }
 }
 
 unsafe fn yama_ptracer_add(tracer: *mut task_struct, tracee: *mut task_struct) {    
     unsafe {
         // mutably borrow spinlock-protected list if present
-        if let Some(ref mut p) = &mut ptracer_relations {
+        // if let Some(ref mut p) = &mut ptracer_relations {
             // lock spinlock to mutably borrow the inner list
-            let list = &mut *p.lock();
+            let list = &mut PTRACE_RELATIONS.lock().0;
             // get a cursor pointing to the first element of the list
             let mut cursor = list.cursor_front_mut();
             // unwrap each element of the list in turn, moving the cursor along
@@ -101,16 +109,16 @@ unsafe fn yama_ptracer_add(tracer: *mut task_struct, tracee: *mut task_struct) {
             pr_info!("Adding new relationship!\n");
             // if an existing relationship wasn't found, add a new one
             list.push_back(Box::try_new(PtraceRelation::new(tracer, tracee, false)).unwrap());
-        }
+        // }
     }
 }
 
 unsafe fn yama_ptracer_del(tracer: *mut task_struct, tracee: *mut task_struct) {
     unsafe {
         // mutably borrow spinlock-protected list if present
-        if let Some(ref mut p) = &mut ptracer_relations {
+        // if let Some(ref mut p) = &mut ptracer_relations {
             // lock spinlock to mutably borrow the inner list
-            let list = &mut *p.lock();
+            let list = &mut PTRACE_RELATIONS.lock().0;
             // get a cursor pointing to the first element of the list
             let mut cursor = list.cursor_front_mut();
             let mut count = 0;
@@ -127,7 +135,7 @@ unsafe fn yama_ptracer_del(tracer: *mut task_struct, tracee: *mut task_struct) {
                 cursor.move_next();
             }
             pr_info!("Relationships: {}\n", count);
-        }
+        // }
 
         yama_relation_cleanup();
     }
@@ -197,9 +205,9 @@ unsafe fn ptracer_exception_found(tracer: *mut task_struct, mut tracee: *mut tas
         }
 
         // mutably borrow spinlock-protected list if present
-        if let Some(ref mut p) = &mut ptracer_relations {
+        // if let Some(ref mut p) = &mut ptracer_relations {
             // lock spinlock to mutably borrow the inner list
-            let list = &mut *p.lock();
+            let list = &mut PTRACE_RELATIONS.lock().0;
             // get a cursor pointing to the first element of the list
             let mut cursor = list.cursor_front_mut();
             // unwrap each element of the list in turn, moving the cursor along
@@ -213,7 +221,7 @@ unsafe fn ptracer_exception_found(tracer: *mut task_struct, mut tracee: *mut tas
                 }
                 cursor.move_next();
             }
-        }
+        // }
 
         if found && (parent == null_mut() || task_is_descendant(parent, tracer)) {
             rcu_read_unlock_exported();
@@ -385,13 +393,13 @@ impl SecurityModule for TestRustLSM {
         // initialize the global, spinlock-protected list of ptracer relations
         // SAFETY: this should be the only place the variable itself is mutated
         // and nothing else will be accessing it as no hooks have been registered
-        unsafe {
-            ptracer_relations = Some(Pin::from(Box::try_new(SpinLock::new(List::new()))?));
-            if let Some(ref mut p) = &mut ptracer_relations {
-                let a = &mut *p.lock();
-                pr_info!("Empty: {}\n", a.is_empty());
-            }
-        }
+        // unsafe {
+        //     ptracer_relations = Some(Pin::from(Box::try_new(SpinLock::new(List::new()))?));
+        //     if let Some(ref mut p) = &mut ptracer_relations {
+        //         let a = &mut *p.lock();
+        //         pr_info!("Empty: {}\n", a.is_empty());
+        //     }
+        // }
 
         // SAFETY: register is being called during init, 
         // and there is no other access to hooks array
