@@ -165,7 +165,7 @@ impl PtraceRelation {
 
 struct PtraceRelationNode {
     relation: PtraceRelation,
-    rcu_head: callback_head,
+    rcu_head: RCUHead,
     pub(crate) invalid: bool,
     links: RCULinks<PtraceRelationNode>,
 }
@@ -174,16 +174,13 @@ impl PtraceRelationNode {
     pub(crate) fn new(relation: PtraceRelation, invalid: bool) -> PtraceRelationNode {
         return PtraceRelationNode {
             relation,
-            rcu_head: callback_head {
-                next: core::ptr::null_mut(),
-                func: None,
-            },
+            rcu_head: RCUHead::new(),
             invalid,
             links: RCULinks::new(),
         };
     }
 
-    fn matches_tracee(&self, tracer_task: TaskStructRef<'_>, tracee_task: TaskStructRef<'_>, ctx: RCULockContextRef<'_>) -> bool {
+    fn matches_tracee(&self, tracer_task: TaskStructRef<'_>, tracee_task: TaskStructRef<'_>, ctx: RCUReadLockRef<'_>) -> bool {
         if !self.invalid {
             match self.relation {
                 PtraceRelation::AnyTracer { tracee } => {
@@ -206,8 +203,8 @@ impl PtraceRelationNode {
 }
 
 impl GetRCUHead for PtraceRelationNode {
-    fn get_rcu_head(&self) -> *mut callback_head {
-        &self.rcu_head as *const _ as *mut _
+    fn get_rcu_head(&self) -> &RCUHead {
+        &self.rcu_head
     }
 }
 

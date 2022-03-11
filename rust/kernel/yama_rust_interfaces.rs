@@ -368,30 +368,30 @@ pub mod rcu {
     use core::marker::PhantomData;
 
     // ZST struct to represent RCU lock context
-    pub struct RCULockContext {
+    pub struct RCUReadLock {
         // private field prevents direct construction
         _private: (),
     }
 
-    impl RCULockContext {
-        pub fn lock() -> RCULockContext {
+    impl RCUReadLock {
+        pub fn lock() -> RCUReadLock {
             unsafe {
                 rcu_read_lock_exported();
             }
-            RCULockContext { _private: () }
+            RCUReadLock { _private: () }
         }
 
         // get a zero-size 'reference' type that behaves as if
         // if holds a reference to self, enforcing that this reference
         // does not outlive self
-        pub fn get_ref<'a>(&'a self) -> RCULockContextRef<'a> {
-            RCULockContextRef {
+        pub fn get_ref<'a>(&'a self) -> RCUReadLockRef<'a> {
+            RCUReadLockRef {
                 _phantom: PhantomData,
             }
         }
     }
 
-    impl Drop for RCULockContext {
+    impl Drop for RCUReadLock {
         fn drop(&mut self) {
             unsafe {
                 rcu_read_unlock_exported();
@@ -401,36 +401,36 @@ pub mod rcu {
 
     // zero-size simulated 'reference' to a valid RCU lock context
     #[derive(Copy, Clone)]
-    pub struct RCULockContextRef<'a> {
-        _phantom: PhantomData<&'a RCULockContext>,
+    pub struct RCUReadLockRef<'a> {
+        _phantom: PhantomData<&'a RCUReadLock>,
     }
 
-    pub fn with_rcu_read_lock<T, F: FnOnce(RCULockContextRef<'_>) -> T>(f: F) -> T {
-        let ctx = RCULockContext::lock();
+    pub fn with_rcu_read_lock<T, F: FnOnce(RCUReadLockRef<'_>) -> T>(f: F) -> T {
+        let ctx = RCUReadLock::lock();
         f(ctx.get_ref())
     }
 
-    pub unsafe fn rcu_dereference<T>(p: *mut *mut T, _ctx: RCULockContextRef<'_>) -> *mut T {
+    pub(crate) unsafe  fn rcu_dereference<T>(p: *mut *mut T, _ctx: RCUReadLockRef<'_>) -> *mut T {
         unsafe { rcu_dereference_exported(p as *mut *mut c_void) as *mut T }
     }
 
-    pub unsafe fn rcu_dereference_const<T>(p: *const *const T, _ctx: RCULockContextRef<'_>) -> *const T {
+    pub(crate) unsafe fn rcu_dereference_const<T>(p: *const *const T, _ctx: RCUReadLockRef<'_>) -> *const T {
         unsafe { rcu_dereference_exported(p as *mut *mut c_void) as *const T }
     }
 
-    pub unsafe fn rcu_assign_pointer<T>(p: *mut *mut T, v: *mut T, _ctx: RCULockContextRef<'_>) {
+    pub(crate) unsafe fn rcu_assign_pointer<T>(p: *mut *mut T, v: *mut T, _ctx: RCUReadLockRef<'_>) {
         unsafe {
             rcu_assign_pointer_exported(p as *mut *mut c_void, v as *mut c_void);
         }
     }
 
     // set callback to free allocated memory
-    unsafe fn rcu_free<T: GetRCUHead>(p: *mut T, _ctx: RCULockContextRef<'_>) {
+    pub(crate) unsafe fn rcu_free<T: GetRCUHead>(p: *mut T, _ctx: RCUReadLockRef<'_>) {
         if p != core::ptr::null_mut() {
             // get pointer to RCU head
-            let rcu_head_ptr = unsafe { (*p).get_rcu_head() };
+            let rcu_head_ptr = unsafe { (*p).get_rcu_head().get() };
             // get offset of RCU head
-            let rcu_head_offset = (rcu_head_ptr as u64) - (p as u64);
+            let rcu_head_offset = (rcu_head_ptr as usize) - (p as usize);
             // convert offset to function pointer type as required by C interface
             let callback: rcu_callback_t = unsafe { Some(core::mem::transmute(rcu_head_offset)) };
             unsafe {
@@ -440,9 +440,28 @@ pub mod rcu {
         }
     }
 
+    pub struct RCUHead {
+        head: callback_head,
+    }
+
+    impl RCUHead {
+        pub fn new() -> RCUHead {
+            RCUHead {
+                head: callback_head {
+                    next: core::ptr::null_mut(),
+                    func: None,
+                }
+            }
+        }
+
+        fn get(&self) -> *mut callback_head {
+            &self.head as *const _ as *mut _
+        }
+    }
+
     // trait for getting an RCU head field from a struct
     pub trait GetRCUHead {
-        fn get_rcu_head(&self) -> *mut callback_head;
+        fn get_rcu_head(&self) -> &RCUHead;
     }
 
     // RCU smart pointer type
@@ -551,7 +570,7 @@ pub mod rcu {
             }
 
             // rcu-dereference and return the pointer to the next element
-            pub fn rcu_dereference_next(&self, ctx: RCULockContextRef<'_>) -> *mut T {
+            pub fn rcu_dereference_next(&self, ctx: RCUReadLockRef<'_>) -> *mut T {
                 let ptr_to_list_entry = self.entry.get();
                 let ptr_to_next_ptr = unsafe { &mut (*ptr_to_list_entry).next as *mut *mut T };
                 unsafe {
@@ -560,7 +579,7 @@ pub mod rcu {
             }
 
         //     // atomically assign the given pointer as the pointer to the next element
-        //     pub fn rcu_assign_next(&self, next: *mut T, ctx: RCULockContextRef<'_>) {
+        //     pub fn rcu_assign_next(&self, next: *mut T, ctx: RCUReadLockRef<'_>) {
         //         let ptr_to_list_entry = self.entry.get();
         //         let ptr_to_next_ptr = unsafe { &mut (*ptr_to_list_entry).next as *mut *mut T };
         //         rcu_assign_pointer(ptr_to_next_ptr, next, ctx);
@@ -584,7 +603,7 @@ pub mod rcu {
                 }
             }
 
-            pub fn cursor_front_rcu<'a, 'b>(&'a self, ctx: RCULockContextRef<'b>) -> RCUListCursor<'a, 'b, T> {
+            pub fn cursor_front_rcu<'a, 'b>(&'a self, ctx: RCUReadLockRef<'b>) -> RCUListCursor<'a, 'b, T> {
                 RCUListCursor {
                     cur: NonNull::new(unsafe { rcu_dereference(
                         &self.head as *const *mut T::EntryType as *mut *mut T::EntryType,
@@ -597,7 +616,7 @@ pub mod rcu {
 
             pub fn cursor_front_mut_rcu<'a, 'b>(
                 &'a mut self,
-                ctx: RCULockContextRef<'b>,
+                ctx: RCUReadLockRef<'b>,
             ) -> RCUListCursorMut<'a, 'b, T> {
                 RCUListCursorMut {
                     cur: NonNull::new(unsafe {rcu_dereference(
@@ -611,7 +630,7 @@ pub mod rcu {
 
             pub fn cursor_front_inplace_mut_rcu<'a, 'b>(
                 &'a self,
-                ctx: RCULockContextRef<'b>,
+                ctx: RCUReadLockRef<'b>,
             ) -> RCUListCursorInplaceMut<'a, 'b, T> {
                 // crate::pr_info!("head: {}\n", self.head as usize);
                 RCUListCursorInplaceMut {
@@ -624,7 +643,7 @@ pub mod rcu {
                 }
             }
 
-            pub fn push_front_rcu(&mut self, new: Box<T::EntryType>, ctx: RCULockContextRef<'_>) {
+            pub fn push_front_rcu(&mut self, new: Box<T::EntryType>, ctx: RCUReadLockRef<'_>) {
                 // convert box to raw pointer to prevent drop
                 let new_ptr = Box::into_raw(new);
                 // SAFETY: new item is owned
@@ -698,7 +717,7 @@ pub mod rcu {
                 Some(unsafe { &*self.cur?.as_ptr() })
             }
 
-            pub fn move_next_rcu(&mut self, ctx: RCULockContextRef<'_>) {
+            pub fn move_next_rcu(&mut self, ctx: RCUReadLockRef<'_>) {
                 if let Some(p) = self.cur {
                     let next_ptr =
                         unsafe { T::get_links(&mut *p.as_ptr()).rcu_dereference_next(ctx) };
@@ -718,7 +737,7 @@ pub mod rcu {
                 Some(self.cur?.as_ptr())
             }
 
-            pub fn move_next_rcu(&mut self, ctx: RCULockContextRef<'_>) {
+            pub fn move_next_rcu(&mut self, ctx: RCUReadLockRef<'_>) {
                 if let Some(p) = self.cur {
                     let next_ptr =
                         unsafe { T::get_links(&mut *p.as_ptr()).rcu_dereference_next(ctx) };
@@ -738,7 +757,7 @@ pub mod rcu {
                 Some(unsafe { &*self.cur?.as_ptr() })
             }
 
-            pub fn move_next_rcu(&mut self, ctx: RCULockContextRef<'_>) {
+            pub fn move_next_rcu(&mut self, ctx: RCUReadLockRef<'_>) {
                 if let Some(p) = self.cur {
                     let next_ptr =
                         unsafe { T::get_links(&mut *p.as_ptr()).rcu_dereference_next(ctx) };
@@ -746,7 +765,7 @@ pub mod rcu {
                 }
             }
 
-            pub fn remove_current_rcu(&mut self, ctx: RCULockContextRef<'_>) {
+            pub fn remove_current_rcu(&mut self, ctx: RCUReadLockRef<'_>) {
                 if let Some(p) = self.cur {
                     // SAFETY: using known valid ptrs as read-only refs
                     let cur_list_entry = unsafe {
@@ -821,7 +840,7 @@ pub mod rcu {
             pub fn replace_current_rcu(
                 &mut self,
                 new: Box<T::EntryType>,
-                ctx: RCULockContextRef<'_>,
+                ctx: RCUReadLockRef<'_>,
             ) {
                 if let Some(p) = self.cur {
                     // convert box to raw pointer to prevent drop
@@ -915,7 +934,7 @@ pub mod task {
     use crate::yama_rust_interfaces::rcu::rcu_dereference;
     use crate::yama_rust_interfaces::rcu::rcu_dereference_const;
     use crate::yama_rust_interfaces::rcu::with_rcu_read_lock;
-    use crate::yama_rust_interfaces::rcu::RCULockContextRef;
+    use crate::yama_rust_interfaces::rcu::RCUReadLockRef;
     use core::convert::TryInto;
     use core::marker::PhantomData;
     use core::ptr::NonNull;
@@ -983,7 +1002,7 @@ pub mod task {
     impl TaskStructID {
         // get a task struct ref that is valid for rcu lock ctx
         // caller must ensure ptr is valid throughout rcu context!
-        pub unsafe fn get_tmp_ref<'a>(&self, _ctx: RCULockContextRef<'a>) -> TaskStructRef<'a> {
+        pub unsafe fn get_tmp_ref<'a>(&self, _ctx: RCUReadLockRef<'a>) -> TaskStructRef<'a> {
             TaskStructRef {
                 ptr: self.ptr,
                 _marker: PhantomData,
@@ -1054,7 +1073,7 @@ pub mod task {
 
         pub fn get_thread_group_leader<'b>(
             &'a self,
-            ctx: RCULockContextRef<'a>,
+            ctx: RCUReadLockRef<'a>,
         ) -> Option<TaskStructRef<'b>> {
             let ptr = unsafe {
                 rcu_dereference(&mut (*self.ptr.as_ptr()).group_leader as *mut *mut _, ctx)
@@ -1070,7 +1089,7 @@ pub mod task {
 
         pub fn get_real_parent<'b>(
             &'a self,
-            ctx: RCULockContextRef<'b>,
+            ctx: RCUReadLockRef<'b>,
         ) -> Option<TaskStructRef<'b>> {
             let ptr = unsafe {
                 rcu_dereference(&mut (*self.ptr.as_ptr()).real_parent as *mut *mut _, ctx)
@@ -1086,7 +1105,7 @@ pub mod task {
 
         pub fn get_ptrace_parent<'b>(
             &'a self,
-            ctx: RCULockContextRef<'b>,
+            ctx: RCUReadLockRef<'b>,
         ) -> Option<TaskStructRef<'b>> {
             let ptr =
                 unsafe { rcu_dereference(&mut (*self.ptr.as_ptr()).parent as *mut *mut _, ctx) };
@@ -1099,7 +1118,7 @@ pub mod task {
             }
         }
 
-        pub fn current_ns_capable(&self, cap: u32, ctx: RCULockContextRef<'_>) -> bool {
+        pub fn current_ns_capable(&self, cap: u32, ctx: RCUReadLockRef<'_>) -> bool {
             let task_cred = unsafe {
                 rcu_dereference_const(&(*self.ptr.as_ptr()).real_cred as *const *const cred, ctx)
             };
@@ -1116,7 +1135,7 @@ pub mod task {
             }
         }
 
-        pub fn is_descendant(&self, child: TaskStructRef<'_>, ctx: RCULockContextRef<'_>) -> bool {
+        pub fn is_descendant(&self, child: TaskStructRef<'_>, ctx: RCUReadLockRef<'_>) -> bool {
             let parent = if self.thread_group_leader() {
                 *self
             } else {
