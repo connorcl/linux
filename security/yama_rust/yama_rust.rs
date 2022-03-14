@@ -191,7 +191,7 @@ impl PtraceRelationNode {
                 PtraceRelation::TracerTracee { tracer, tracee } => {
                     if tracee_task.get_id() == tracee {
                         let tmp_tracer_ref = unsafe {
-                            tracer.get_tmp_ref(ctx)
+                            tracer.get_tmp_ref()
                         };
                         return tmp_tracer_ref.is_descendant(tracer_task, ctx);
                     }
@@ -242,9 +242,9 @@ impl PtraceRelationList {
                 // check if the relation is invalid and remove if so
                 if relation.invalid {
                     // pr_info!("Removing invalid relationship!\n");
-                    cursor.remove_current_rcu(ctx);
+                    cursor.remove_current_rcu();
                 } else {
-                    cursor.move_next_rcu(ctx);
+                    cursor.move_next_rcu();
                 }
             }
         });
@@ -281,21 +281,21 @@ impl PtraceRelationList {
             while let Some(relation_node) = cursor.current() {
                 count += 1;
                 if !relation_node.invalid {
-                    pr_info!("Valid!\n");
+                    // pr_info!("Valid!\n");
                     // update tracer if an existing relationship is present
                     let t = relation_node.relation.get_tracee();
                     // pr_info!("t: {}, new relation_tracee: {}\n", t.get_ptr() as usize, relation_tracee.get_ptr() as usize);
                     if t == relation_tracee {
-                        pr_info!("Replacing relationship! count: {}\n", count);
-                        cursor.replace_current_rcu(new_item, ctx);
+                        // pr_info!("Replacing relationship! count: {}\n", count);
+                        cursor.replace_current_rcu(new_item);
                         return;
                     }
                 }
                 
-                cursor.move_next_rcu(ctx);
+                cursor.move_next_rcu();
             }
 
-            pr_info!("Adding new relationship! count: {}\n", count);
+            // pr_info!("Adding new relationship! count: {}\n", count);
             // if an existing relationship wasn't found, add a new one
             
             // let d = unsafe { ktime_get() };
@@ -338,7 +338,7 @@ impl PtraceRelationList {
                             &relation_node.relation
                         {
                             if *t == *tracer {
-                                pr_info!("Found match, marking relationship as invalid!\n");
+                                // pr_info!("Found match, marking relationship as invalid!\n");
                                 // SAFETY: updating invalid is safe, see above
                                 unsafe {
                                     (*relation_node_ptr).invalid = true;
@@ -351,7 +351,7 @@ impl PtraceRelationList {
                     if let Some(t) = &tracee_task {
                         // SAFETY: reading current item is always safe
                         if *t == relation_node.relation.get_tracee() {
-                            pr_info!("Found match, marking relationship as invalid!\n");
+                            // pr_info!("Found match, marking relationship as invalid!\n");
                             // SAFETY: updating invalid is safe, see above
                             unsafe {
                                 (*relation_node_ptr).invalid = true;
@@ -360,7 +360,7 @@ impl PtraceRelationList {
                         }
                     }
                 }
-                cursor.move_next_rcu(ctx);
+                cursor.move_next_rcu();
             }
             // pr_info!("Relationships: {}\n", count);
 
@@ -401,7 +401,7 @@ impl PtraceRelationList {
                 if relation_node.matches_tracee(tracer_task, tracee_task, ctx) {
                     return true;
                 }
-                cursor.move_next_rcu(ctx);
+                cursor.move_next_rcu();
             }
 
             return false;
