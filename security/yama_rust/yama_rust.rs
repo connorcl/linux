@@ -16,7 +16,7 @@ use kernel::yama_rust_interfaces::sysctl::*;
 use kernel::yama_rust_interfaces::task::*;
 use kernel::yama_rust_interfaces::work_queue::*;
 use kernel::Error;
-use kernel::{define_lsm, init_static_sync};
+use kernel::{define_lsm, init_static_sync, init_static_work_struct};
 
 define_lsm!(
     "yama_rust",
@@ -31,8 +31,12 @@ init_static_sync! {
     static PTRACE_RELATION_LIST_WRITE_LOCK: SpinLock<()> = ();
 }
 
-static PTRACE_RELATION_LIST_CLEANUP_WORK: StaticWorkStruct<PtraceRelationListCleanup> =
-    StaticWorkStruct::new();
+// static PTRACE_RELATION_LIST_CLEANUP_WORK: StaticWorkStruct<PtraceRelationListCleanup> =
+    // StaticWorkStruct::init(&PTRACE_RELATION_LIST_CLEANUP_WORK);
+
+init_static_work_struct! {
+    static PTRACE_RELATION_LIST_CLEANUP_WORK: StaticWorkStruct<PtraceRelationListCleanup>;
+}
 
 static PTRACE_SCOPE: SysctlInt<PtraceScopeSysctlIntHooks> = SysctlInt::new(
     PtraceScope::default(),
@@ -46,7 +50,7 @@ static PTRACER_RELATIONS: PtraceRelationList = PtraceRelationList::new();
 struct PtraceRelationListCleanup;
 
 impl StaticWorkFunc for PtraceRelationListCleanup {
-    fn work_func(_work: *mut work_struct) {
+    fn work_func() {
         pr_info!("Relation cleanup from work queue!\n");
         PTRACER_RELATIONS.cleanup_relations();
     }
@@ -66,7 +70,7 @@ impl DynamicWorkFunc<AccessReportInfo> for ReportAccessWorkFunc {
     }
 }
 
-type ReportAccessPayload = DynamicWorkPayload<AccessReportInfo, ReportAccessWorkFunc>;
+type ReportAccessTask = DynamicWorkStruct<AccessReportInfo, ReportAccessWorkFunc>;
 
 fn report_access(access: &'static CStr, target: TaskStructRef<'_>, agent: TaskStructRef<'_>) {
     if TaskStruct::current()
@@ -78,7 +82,7 @@ fn report_access(access: &'static CStr, target: TaskStructRef<'_>, agent: TaskSt
         return;
     }
 
-    ReportAccessPayload::create_and_schedule(AccessReportInfo {
+    ReportAccessTask::create_and_schedule(AccessReportInfo {
         access: access,
         target: Some(target.get_task_struct()),
         agent: Some(agent.get_task_struct()),
@@ -570,9 +574,9 @@ impl SecurityModule for YamaRust {
 
         // SAFETY: exclusive write access from this init function,
         // and no read accesses as hooks have not been registered
-        unsafe {
-            PTRACE_RELATION_LIST_CLEANUP_WORK.init(init_ctx);
-        }
+        // unsafe {
+        //     PTRACE_RELATION_LIST_CLEANUP_WORK.init(init_ctx);
+        // }
 
         // SAFETY: register() is being called during initialization
         unsafe { hooks.register(init_ctx) };

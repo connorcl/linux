@@ -21,7 +21,7 @@ pub mod init_context {
     /// is still in the init phase.
     pub struct InitContext {
         // prevents direct construction
-        _private: PhantomData<()>,
+        _private: (),
     }
 
     impl InitContext {
@@ -35,7 +35,7 @@ pub mod init_context {
         #[link_section = ".init.text"]
         pub unsafe fn new() -> InitContext {
             InitContext {
-                _private: PhantomData,
+                _private: (),
             }
         }
 
@@ -967,42 +967,42 @@ pub mod task {
             Some(TaskStructRef { ptr: p, _marker: PhantomData })
         }
 
-        pub fn get_task_struct(&self) -> TaskStruct {
+        pub fn get_task_struct(self) -> TaskStruct {
             TaskStruct::from_nonnull(self.ptr)
         }
 
-        pub fn get_id(&self) -> TaskStructID {
+        pub fn get_id(self) -> TaskStructID {
             TaskStructID { ptr: self.ptr }
         }
 
-        pub fn pid(&self) -> pid_t {
+        pub fn pid(self) -> pid_t {
             unsafe { (*self.ptr.as_ptr()).pid }
         }
 
-        pub fn same_thread_group(&self, other: TaskStructRef<'_>) -> bool {
+        pub fn same_thread_group(self, other: TaskStructRef<'_>) -> bool {
             unsafe { (*self.ptr.as_ptr()).signal == (*other.ptr.as_ptr()).signal }
         }
 
-        pub fn thread_group_leader(&self) -> bool {
+        pub fn thread_group_leader(self) -> bool {
             unsafe { (*self.ptr.as_ptr()).exit_signal >= 0 }
         }
 
-        pub fn pid_alive(&self) -> bool {
+        pub fn pid_alive(self) -> bool {
             unsafe { (*self.ptr.as_ptr()).thread_pid != core::ptr::null_mut() }
         }
 
-        pub fn flags_set(&self, flags: u32) -> bool {
+        pub fn flags_set(self, flags: u32) -> bool {
             unsafe { (*self.ptr.as_ptr()).flags & flags != 0 }
         }
 
-        pub fn current_ns_capable(&self, cap: u32, ctx: RCUReadLockRef<'_>) -> bool {
+        pub fn current_ns_capable(self, cap: u32, ctx: RCUReadLockRef<'_>) -> bool {
             let task_cred = unsafe {
                 rcu_dereference_const(&(*self.ptr.as_ptr()).real_cred as *const *const cred, ctx)
             };
             unsafe { ns_capable_exported((*task_cred).user_ns, cap.try_into().unwrap()) >= 0 }
         }
 
-        pub fn has_ns_capability_current(&self, cap: u32) -> bool {
+        pub fn has_ns_capability_current(self, cap: u32) -> bool {
             unsafe {
                 has_ns_capability(
                     self.ptr.as_ptr(),
@@ -1044,9 +1044,9 @@ pub mod task {
             Some(TaskStructRef { ptr, _marker: PhantomData, })
         }
 
-        pub fn is_descendant(&self, child: TaskStructRef<'_>, ctx: RCUReadLockRef<'_>) -> bool {
+        pub fn is_descendant(self, child: TaskStructRef<'_>, ctx: RCUReadLockRef<'_>) -> bool {
             let parent = if self.thread_group_leader() {
-                *self
+                self
             } else {
                 self.get_thread_group_leader(ctx).unwrap()
             };
@@ -1067,41 +1067,6 @@ pub mod task {
         }
     }
 
-    // pub fn get_thread_group_leader<'a>(
-    //     t: TaskStructRef<'a>,
-    //     ctx: RCUReadLockRef<'a>,
-    // ) -> Option<TaskStructRef<'a>> {
-    //     if t.thread_group_leader() {
-    //         return Some(t);
-    //     }
-    //     let ptr = unsafe {
-    //         rcu_dereference(&mut (*t.ptr.as_ptr()).group_leader as *mut *mut _, ctx)
-    //     };
-    //     let ptr = NonNull::new(ptr)?;
-    //     Some(TaskStructRef { ptr, _marker: PhantomData, })
-    // }
-
-    // pub fn get_real_parent<'a>(
-    //     t: TaskStructRef<'a>,
-    //     ctx: RCUReadLockRef<'a>,
-    // ) -> Option<TaskStructRef<'a>> {
-    //     let ptr = unsafe {
-    //         rcu_dereference(&mut (*t.ptr.as_ptr()).real_parent as *mut *mut _, ctx)
-    //     };
-    //     let ptr = NonNull::new(ptr)?; 
-    //     Some(TaskStructRef { ptr, _marker: PhantomData, })
-    // }
-
-    // pub fn get_ptrace_parent<'a>(
-    //     t: TaskStructRef<'a>,
-    //     ctx: RCUReadLockRef<'a>,
-    // ) -> Option<TaskStructRef<'a>> {
-    //     let ptr =
-    //         unsafe { rcu_dereference(&mut (*t.ptr.as_ptr()).parent as *mut *mut _, ctx) };
-    //     let ptr = NonNull::new(ptr)?; 
-    //     Some(TaskStructRef { ptr, _marker: PhantomData, })
-    // }
-
     pub fn current_capable(cap: i32) -> bool {
         unsafe { capable_exported(cap) }
     }
@@ -1115,104 +1080,91 @@ pub mod work_queue {
     use crate::yama_rust_interfaces::init_context::*;
     use alloc::boxed::Box;
     use core::marker::PhantomData;
+    use core::cell::UnsafeCell;
 
     pub trait StaticWorkFunc {
-        fn work_func(work: *mut work_struct);
+        fn work_func();
     }
 
-    struct StaticWorkFuncCInterface<T: StaticWorkFunc> {
-        _marker: PhantomData<T>,
-    }
-
-    impl<T: StaticWorkFunc> StaticWorkFuncCInterface<T> {
-        pub(crate) unsafe extern "C" fn work_func(work: *mut work_struct) {
-            T::work_func(work);
-        }
+    unsafe extern "C" fn static_work_func<T: StaticWorkFunc>(_work: *mut work_struct) {
+        T::work_func();
     }
 
     pub struct StaticWorkStruct<T: StaticWorkFunc> {
-        work: InitCell<Option<work_struct>>,
+        work: UnsafeCell<work_struct>,
         _marker: PhantomData<T>,
     }
 
     impl<T: StaticWorkFunc> StaticWorkStruct<T> {
-        pub const fn new() -> StaticWorkStruct<T> {
+        pub const fn init(this: &'static StaticWorkStruct<T>) -> StaticWorkStruct<T> {
+            // SAFETY: pointer is valid and no race condition is possible
+            // as this const function is evaluated at compile time
+            let this_entry_ptr = unsafe {
+                &((*this.work.get()).entry) as *const _ as *mut _
+            };
             StaticWorkStruct {
-                work: InitCell::new(None),
+                work: UnsafeCell::new(
+                    work_struct {
+                        data: atomic_long_t {
+                            counter: (WORK_STRUCT_NO_POOL | WORK_STRUCT_STATIC),
+                        },
+                        entry: list_head {
+                            next: this_entry_ptr,
+                            prev: this_entry_ptr,
+                        },
+                        func: Some(static_work_func::<T>),
+                    }
+                ),
                 _marker: PhantomData,
             }
         }
 
-        #[link_section = ".init.text"]
-        pub unsafe fn init(&'static self, init_ctx: InitContextRef<'_>) {
-            // SAFETY: mutating data is safe during init phase
-            unsafe {
-                *self.work.get(init_ctx) = Some(work_struct {
-                    data: atomic_long_t {
-                        counter: (WORK_STRUCT_NO_POOL | WORK_STRUCT_STATIC),
-                    },
-                    entry: list_head {
-                        next: core::ptr::null_mut(),
-                        prev: core::ptr::null_mut(),
-                    },
-                    func: Some(StaticWorkFuncCInterface::<T>::work_func),
-                });
-                if let Some(ref mut work) = *self.work.get(init_ctx) {
-                    work.entry.next = &mut work.entry as *mut _;
-                    work.entry.prev = &mut work.entry as *mut _;
-                }
-            }
-        }
-
         pub fn schedule(&'static self) {
-            // SAFETY: pointer is guaranteed to be valid and is
-            // immediately converted to an immutable reference
-            if let Some(work) = self.work.get_ref() {
-                // SAFETY: FFI call, self is static so work will be valid
-                unsafe {
-                    schedule_work_exported(work as *const _ as *mut _);
-                }
+            unsafe {
+                schedule_work_exported(self.work.get() as *const _ as *mut _);
             }
         }
     }
 
+    #[macro_export]
+    macro_rules! init_static_work_struct {
+        ($(#[$outer:meta])* $v:vis static $id:ident : StaticWorkStruct < $t:ty > ;) => {
+            $(#[$outer])*
+            $v static $id: StaticWorkStruct<$t> = StaticWorkStruct::init(&$id);
+        };
+    }
+
+    // this type's methods do not read or write any of its data
     unsafe impl<T: StaticWorkFunc> Sync for StaticWorkStruct<T> {}
 
     pub trait DynamicWorkFunc<T> {
         fn work_func(data: &T);
     }
 
-    struct DynamicWorkFuncCInterface<T, U: DynamicWorkFunc<T>> {
-        _marker_t: PhantomData<T>,
-        _marker_u: PhantomData<U>,
+    unsafe extern "C" fn dynamic_work_func<T, U: DynamicWorkFunc<T>>(work: *mut callback_head) {
+        // SAFETY: callback_head pts to field of Box-allocated work payload
+        let payload = unsafe {
+            Box::from_raw(container_of!(work, DynamicWorkStruct<T, U>, work_head)
+                as *mut DynamicWorkStruct<T, U>)
+        };
+        U::work_func(&(*payload).data);
+        // box goes out of scope and dynamicaly allocated payload is freed
     }
-
-    impl<T, U: DynamicWorkFunc<T>> DynamicWorkFuncCInterface<T, U> {
-        pub(crate) unsafe extern "C" fn work_func(work: *mut callback_head) {
-            // SAFETY: callback_head pts to field of Box-allocated work payload
-            let payload = unsafe {
-                Box::from_raw(container_of!(work, DynamicWorkPayload<T, U>, work_head)
-                    as *mut DynamicWorkPayload<T, U>)
-            };
-            U::work_func(&(*payload).data);
-            // box goes out of scope and dynamicaly allocated payload is freed
-        }
-    }
-
-    pub struct DynamicWorkPayload<T, U: DynamicWorkFunc<T>> {
+    
+    pub struct DynamicWorkStruct<T, U: DynamicWorkFunc<T>> {
         data: T,
         work_head: callback_head,
         _marker: PhantomData<U>,
     }
 
-    impl<T, U: DynamicWorkFunc<T>> DynamicWorkPayload<T, U> {
+    impl<T, U: DynamicWorkFunc<T>> DynamicWorkStruct<T, U> {
         pub fn create_and_schedule(data: T) {
             // dynamically allocate a new payload
-            let payload: Box<DynamicWorkPayload<T, U>> = Box::try_new(DynamicWorkPayload {
+            let payload: Box<DynamicWorkStruct<T, U>> = Box::try_new(DynamicWorkStruct {
                 data: data,
                 work_head: callback_head {
                     next: core::ptr::null_mut(),
-                    func: Some(DynamicWorkFuncCInterface::<T, U>::work_func),
+                    func: Some(dynamic_work_func::<T, U>),
                 },
                 _marker: PhantomData,
             })
