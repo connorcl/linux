@@ -31,18 +31,21 @@ init_static_sync! {
     static PTRACE_RELATION_LIST_WRITE_LOCK: SpinLock<()> = ();
 }
 
-// static PTRACE_RELATION_LIST_CLEANUP_WORK: StaticWorkStruct<PtraceRelationListCleanup> =
-    // StaticWorkStruct::init(&PTRACE_RELATION_LIST_CLEANUP_WORK);
-
 init_static_work_struct! {
     static PTRACE_RELATION_LIST_CLEANUP_WORK: StaticWorkStruct<PtraceRelationListCleanup>;
 }
 
-static PTRACE_SCOPE: SysctlInt<PtraceScopeSysctlIntHooks> = SysctlInt::new(
+static PTRACE_SCOPE: BoundedInt = BoundedInt::new(
     PtraceScope::default(),
     PtraceScope::min(),
     PtraceScope::max(),
-    gen_sysctl_path!("kernel", "yama"),
+);
+
+static PTRACE_SCOPE_SYSCTL_ENTRY: SysctlInt<PtraceScopeWriteHook> = SysctlInt::init(
+        &PTRACE_SCOPE,
+        c_str!("ptrace_scope"),
+        0o0644,
+        gen_sysctl_path!("kernel", "yama"),
 );
 
 static PTRACER_RELATIONS: PtraceRelationList = PtraceRelationList::new();
@@ -58,35 +61,53 @@ impl StaticWorkFunc for PtraceRelationListCleanup {
 
 struct AccessReportInfo {
     access: &'static CStr,
-    target: Option<TaskStruct>,
-    agent: Option<TaskStruct>,
+    target: TaskStruct,
+    agent: TaskStruct,
 }
 
-struct ReportAccessWorkFunc;
+struct ReportAccess;
 
-impl DynamicWorkFunc<AccessReportInfo> for ReportAccessWorkFunc {
+impl DynamicWorkFunc<AccessReportInfo> for ReportAccess {
     fn work_func(data: &AccessReportInfo) {
-        pr_info!("Report access: {}\n", data.access);
+        let target_cmdline = data.target.get_ref().get_cmdline_str();
+        let agent_cmdline = data.agent.get_ref().get_cmdline_str();
+        let target_cmdline = if let Some(ref t) = target_cmdline {
+            &*t
+        } else {
+            c_str!("")
+        };
+        let agent_cmdline = if let Some(ref a) = agent_cmdline {
+            &*a
+        } else {
+            c_str!("")
+        };
+        pr_notice!(
+            "ptrace {} of \"{}\"[{}] was attempted by \"{}\"[{}]\n", 
+            data.access,
+            target_cmdline,
+            data.target.get_ref().pid(),
+            agent_cmdline,
+            data.agent.get_ref().pid(),
+        );
     }
 }
 
-type ReportAccessTask = DynamicWorkStruct<AccessReportInfo, ReportAccessWorkFunc>;
+type ReportAccessTask = DynamicWorkStruct<AccessReportInfo, ReportAccess>;
 
 fn report_access(access: &'static CStr, target: TaskStructRef<'_>, agent: TaskStructRef<'_>) {
-    if TaskStruct::current()
-        .unwrap()
-        .get_ref()
-        .flags_set(PF_KTHREAD)
-    {
-        pr_info!("Report access inline!\n");
-        return;
-    }
-
-    ReportAccessTask::create_and_schedule(AccessReportInfo {
+    let info = AccessReportInfo {
         access: access,
-        target: Some(target.get_task_struct()),
-        agent: Some(agent.get_task_struct()),
-    });
+        target: target.get_task_struct(),
+        agent: agent.get_task_struct(),
+    };
+
+    if let Some(current) = TaskStruct::current() {
+        if current.get_ref().flags_set(PF_KTHREAD) {
+            ReportAccess::work_func(&info);
+        } else {
+            ReportAccessTask::create_and_schedule(info);
+        }
+    }   
 }
 
 #[derive(Copy, Clone)]
@@ -129,18 +150,18 @@ impl PtraceScope {
     }
 }
 
-struct PtraceScopeSysctlIntHooks;
+struct PtraceScopeWriteHook;
 
-impl SysctlIntHooks for PtraceScopeSysctlIntHooks {
-    fn write_hook(table: &mut ctl_table) -> Result<()> {
-        if current_capable(CAP_SYS_PTRACE.try_into().unwrap()) {
+impl SysctlIntWriteHook for PtraceScopeWriteHook {
+    fn write_hook(table: &mut SysctlTable) -> Result {
+        if !current_capable(CAP_SYS_PTRACE.try_into().unwrap()) {
             pr_info!("Setting ptrace scope not permitted!\n");
             return Err(Error::EPERM);
         }
 
-        if unsafe { *(table.data as *mut c_int) } == unsafe { *(table.extra2 as *mut c_int) } {
+        if table.get_data() == table.get_max() {
             pr_info!("Locking scope to highest value!\n");
-            table.extra1 = table.extra2;
+            table.lock_max();
         }
 
         Ok(())
@@ -259,59 +280,59 @@ impl PtraceRelationList {
         // let a = unsafe { ktime_get() };
 
         // allocate memory for new item
-        let new_item = Box::try_new(PtraceRelationNode::new(relation, false)).unwrap();
+        let new_item = Box::try_new(PtraceRelationNode::new(relation, false));
 
-        // lock spinlock to synchronize mutable access to list
-        let _lock  = PTRACE_RELATION_LIST_WRITE_LOCK.lock();
-        
-        // get reference to list: safe as lock is held
-        let list = unsafe { &mut *self.list.get() };
-
-        // let b = unsafe { ktime_get() };
-        
-        // let c = unsafe { ktime_get() };
-        
-        // enter RCU critical section
-        with_rcu_read_lock(|ctx| {
-
-            let relation_tracee = new_item.relation.get_tracee();
+        if let Ok(n) = new_item {
+            // lock spinlock to synchronize mutable access to list
+            let _lock = PTRACE_RELATION_LIST_WRITE_LOCK.lock();
             
-            // get a cursor pointing to the first element of the list
-            let mut cursor = list.cursor_front_mut_rcu(ctx);
-            // unwrap each element of the list in turn, moving the cursor along
-            
-            let mut count = 0;
+            // get reference to list: safe as lock is held
+            let list = unsafe { &mut *self.list.get() };
 
-            while let Some(relation_node) = cursor.current() {
-                count += 1;
-                if !relation_node.invalid {
-                    // pr_info!("Valid!\n");
-                    // update tracer if an existing relationship is present
-                    let t = relation_node.relation.get_tracee();
-                    // pr_info!("t: {}, new relation_tracee: {}\n", t.get_ptr() as usize, relation_tracee.get_ptr() as usize);
-                    if t == relation_tracee {
-                        // pr_info!("Replacing relationship! count: {}\n", count);
-                        cursor.replace_current_rcu(new_item);
-                        return;
-                    }
-                }
+            // let b = unsafe { ktime_get() };
+            
+            // let c = unsafe { ktime_get() };
+            
+            // enter RCU critical section
+            with_rcu_read_lock(|ctx| {
+
+                let relation_tracee = n.relation.get_tracee();
                 
-                cursor.move_next_rcu();
-            }
+                // get a cursor pointing to the first element of the list
+                let mut cursor = list.cursor_front_mut_rcu(ctx);
+                // unwrap each element of the list in turn, moving the cursor along
+                
+                let mut count = 0;
 
-            // pr_info!("Adding new relationship! count: {}\n", count);
-            // if an existing relationship wasn't found, add a new one
-            
-            // let d = unsafe { ktime_get() };
-            
-            list.push_front_rcu(new_item, ctx);
+                while let Some(relation_node) = cursor.current() {
+                    count += 1;
+                    if !relation_node.invalid {
+                        // pr_info!("Valid!\n");
+                        // update tracer if an existing relationship is present
+                        let t = relation_node.relation.get_tracee();
+                        // pr_info!("t: {}, new relation_tracee: {}\n", t.get_ptr() as usize, relation_tracee.get_ptr() as usize);
+                        if t == relation_tracee {
+                            // pr_info!("Replacing relationship! count: {}\n", count);
+                            cursor.replace_current_rcu(n);
+                            return;
+                        }
+                    }
+                    
+                    cursor.move_next_rcu();
+                }
 
-            // let e = unsafe { ktime_get() };
-            // pr_info!("Add time: {}\n", e-a);
-            // pr_info!("Times: {}, {}, {}, {}. Total: {}, Count: {}\n", b - a, c - b, d - c, e - d, e - a, count);
-        });
+                // pr_info!("Adding new relationship! count: {}\n", count);
+                // if an existing relationship wasn't found, add a new one
+                
+                // let d = unsafe { ktime_get() };
+                
+                list.push_front_rcu(n, ctx);
 
-
+                // let e = unsafe { ktime_get() };
+                // pr_info!("Add time: {}\n", e-a);
+                // pr_info!("Times: {}, {}, {}, {}. Total: {}, Count: {}\n", b - a, c - b, d - c, e - d, e - a, count);
+            });
+        }
     }
 
     pub(crate) fn del_relation(
@@ -425,7 +446,7 @@ impl SecurityModule for YamaRust {
         if (mode & PTRACE_MODE_ATTACH) != 0 {
             // pr_info!("Ptrace attach!\n");
 
-            match PtraceScope::from_int(PTRACE_SCOPE.get_value()) {
+            match PtraceScope::from_int(PTRACE_SCOPE.get_val()) {
                 Some(PtraceScope::Disabled) => {
                     ret = Ok(());
                 }
@@ -471,7 +492,7 @@ impl SecurityModule for YamaRust {
                     pr_info!("Denied!\n");
                     ret = Err(Error::EPERM);
                 }
-                None => {
+                _ => {
                     pr_info!("Denied!\n");
                     ret = Err(Error::EPERM);
                 }
@@ -484,13 +505,13 @@ impl SecurityModule for YamaRust {
     fn ptrace_traceme(parent: TaskStructRef<'_>) -> Result {
         let mut ret = Ok(());
 
-        if let Some(PtraceScope::Capability) = PtraceScope::from_int(PTRACE_SCOPE.get_value()) {
+        if let Some(PtraceScope::Capability) = PtraceScope::from_int(PTRACE_SCOPE.get_val()) {
             let has_capability = parent.has_ns_capability_current(CAP_SYS_PTRACE);
             if !has_capability {
                 ret = Err(Error::EPERM);
                 pr_info!("Traceme denied!\n");
             }
-        } else if let Some(PtraceScope::NoAttach) = PtraceScope::from_int(PTRACE_SCOPE.get_value())
+        } else if let Some(PtraceScope::NoAttach) = PtraceScope::from_int(PTRACE_SCOPE.get_val())
         {
             pr_info!("Traceme denied!\n");
             ret = Err(Error::EPERM);
@@ -583,11 +604,11 @@ impl SecurityModule for YamaRust {
 
         // SAFETY: exclusive write access from this init function,
         // and no read accesses until the next line (register)
-        unsafe {
-            PTRACE_SCOPE.init(c_str!("ptrace_scope"), 0o0644, init_ctx);
-        }
+        // unsafe {
+        //     PTRACE_SCOPE.init(c_str!("ptrace_scope"), 0o0644, init_ctx);
+        // }
 
-        PTRACE_SCOPE.register();
+        PTRACE_SCOPE_SYSCTL_ENTRY.register();
 
         // match ret {
         //     Ok(_) => {

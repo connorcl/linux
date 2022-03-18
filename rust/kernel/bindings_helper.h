@@ -40,6 +40,7 @@
 #include <linux/task_work.h>
 #include <linux/sysctl.h>
 #include <linux/timekeeping.h>
+#include <linux/string_helpers.h>
 
 // `bindgen` gets confused at certain things
 const gfp_t BINDINGS_GFP_KERNEL = GFP_KERNEL;

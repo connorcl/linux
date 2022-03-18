@@ -682,6 +682,17 @@ pub mod rcu {
             }
         }
 
+        impl<T: GetRCUHead + RCUGetLinks> Drop for RCUList<T> {
+            fn drop(&mut self) {
+                with_rcu_read_lock(|ctx| {
+                    let mut c = self.cursor_front_mut_rcu(ctx);
+                    while let Some(_) = c.current() {
+                        c.remove_current_rcu();
+                    }
+                });
+            }
+        }
+
         pub struct RCUListCursor<'a, 'b, T: RCUGetLinks + GetRCUHead> {
             cur: Option<NonNull<T::EntryType>>,
             _list: PhantomData<&'a RCUList<T::EntryType>>,
@@ -872,6 +883,7 @@ pub mod task {
     use core::convert::TryInto;
     use core::marker::PhantomData;
     use core::ptr::NonNull;
+    use crate::prelude::{Box, CStr};
 
     pub struct TaskStruct {
         ptr: NonNull<task_struct>,
@@ -1009,6 +1021,22 @@ pub mod task {
                     current_user_ns_exported(),
                     cap.try_into().unwrap(),
                 )
+            }
+        }
+
+        pub fn get_cmdline_str(self) -> Option<Box<CStr>> {
+            let cmdline_str_ptr = unsafe {
+                kstrdup_quotable_cmdline(self.ptr.as_ptr(), GFP_KERNEL)
+            };
+            if cmdline_str_ptr != core::ptr::null_mut() {
+                let cmdline_str = unsafe {
+                    CStr::from_char_ptr(cmdline_str_ptr)
+                };
+                unsafe {
+                    Some(Box::from_raw(cmdline_str as *const _ as *mut _))
+                }
+            } else {
+                None
             }
         }
 
@@ -1192,131 +1220,154 @@ pub mod sysctl {
     use crate::c_types::*;
     use crate::prelude::*;
     use crate::str::CStr;
+    use crate::c_str;
     use crate::yama_rust_interfaces::init_context::{InitCell, InitContextRef};
     use core::marker::PhantomData;
+    use core::cell::UnsafeCell;
+
+    pub struct SysctlPath(ctl_path);
+
+    impl SysctlPath {
+        pub const fn new(path: &'static CStr) -> SysctlPath {
+            SysctlPath(ctl_path {
+                procname: path.as_char_ptr(),
+            })
+        }
+
+        pub const fn null() -> SysctlPath {
+            SysctlPath(ctl_path {
+                procname: core::ptr::null(),
+            })
+        }
+    }
 
     #[macro_export]
     macro_rules! gen_sysctl_path {
         ( $($p:literal),+ ) => {
             &[
                 $(
-                    ctl_path {
-                        procname: c_str!($p).as_char_ptr(),
-                    },
+                    SysctlPath::new(c_str!($p)),
                 )*
-                ctl_path {
-                    procname: core::ptr::null(),
-                },
+                SysctlPath::null(),
             ]
         }
     }
 
-    pub trait SysctlIntHooks {
-        fn write_hook(table: &mut ctl_table) -> Result<()>;
+    pub struct SysctlTable(ctl_table);
+
+    impl SysctlTable {
+        pub const fn get_data(&self) -> i32 { 
+            unsafe { *(self.0.data as *const i32) }
+        }
+
+        pub const fn get_min(&self) -> i32 { 
+            unsafe { *(self.0.extra1 as *const i32) } 
+        }
+
+        pub const fn get_max(&self) -> i32 { 
+            unsafe { *(self.0.extra1 as *const i32) }
+        }
+
+        pub fn lock_max(&mut self) { self.0.extra1 = self.0.extra2 }
+
+        pub fn lock_min(&mut self) { self.0.extra2 = self.0.extra1 }
     }
 
-    struct SysctlDoIntVecMinMax<T: SysctlIntHooks> {
-        _marker: PhantomData<T>,
+    pub trait SysctlIntWriteHook {
+        fn write_hook(table: &mut SysctlTable) -> Result;
     }
 
-    impl<T: SysctlIntHooks> SysctlDoIntVecMinMax<T> {
-        pub(crate) unsafe extern "C" fn dointvec_minmax(
-            table: *mut ctl_table,
-            write: c_int,
-            buffer: *mut c_void,
-            lenp: *mut c_size_t,
-            ppos: *mut loff_t,
-        ) -> c_int {
-            let mut table_copy = unsafe { *table };
+    unsafe extern "C" fn dointvec_minmax<T: SysctlIntWriteHook>(
+        table: *mut ctl_table,
+        write: c_int,
+        buffer: *mut c_void,
+        lenp: *mut c_size_t,
+        ppos: *mut loff_t,
+    ) -> c_int {
+        let mut table_copy = unsafe { SysctlTable(*table) };
 
-            if write != 0 {
-                if let Err(e) = T::write_hook(&mut table_copy) {
-                    return e.to_kernel_errno();
-                }
+        if write != 0 {
+            if let Err(e) = T::write_hook(&mut table_copy) {
+                return e.to_kernel_errno();
             }
+        }
 
-            return unsafe {
-                proc_dointvec_minmax(&mut table_copy as *mut _, write, buffer, lenp, ppos)
-            };
+        unsafe {
+            proc_dointvec_minmax(&mut table_copy as *mut _ as *mut _, write, buffer, lenp, ppos)
         }
     }
 
-    pub struct SysctlInt<T: SysctlIntHooks> {
-        val: c_int,
+    pub struct BoundedInt {
+        val: UnsafeCell<c_int>,
         min: c_int,
         max: c_int,
-        sysctl_path: &'static [ctl_path],
-        sysctl_table: InitCell<Option<[ctl_table; 2]>>,
+    }
+
+    unsafe impl Sync for BoundedInt {}
+
+    impl BoundedInt {
+        pub const fn new(val: i32, min: i32, max: i32) -> BoundedInt {
+            BoundedInt { val: UnsafeCell::new(val), min, max }
+        }
+
+        pub const fn get_val(&self) -> i32 { unsafe { *self.val.get() } }
+    }
+
+    pub struct SysctlInt<T: SysctlIntWriteHook> {
+        data: &'static BoundedInt,
+        sysctl_path: &'static [SysctlPath],
+        sysctl_table: UnsafeCell<[ctl_table; 2]>,
         _marker: PhantomData<T>,
     }
 
-    impl<T: SysctlIntHooks> SysctlInt<T> {
-        pub const fn new(
-            default: c_int,
-            min: c_int,
-            max: c_int,
-            path: &'static [ctl_path],
+    impl<T: SysctlIntWriteHook> SysctlInt<T> {
+        pub const fn init(
+            data: &'static BoundedInt,
+            name: &'static CStr,
+            mode: u16,
+            path: &'static [SysctlPath],
         ) -> SysctlInt<T> {
             SysctlInt {
-                val: default,
-                min: min,
-                max: max,
+                data,
                 sysctl_path: path,
-                sysctl_table: InitCell::new(None),
+                sysctl_table: UnsafeCell::new([
+                    ctl_table {
+                        procname: name.as_char_ptr(),
+                        data: &data.val as *const _ as *mut c_void,
+                        maxlen: core::mem::size_of::<c_int>() as _,
+                        mode: mode as _,
+                        child: core::ptr::null_mut(),
+                        proc_handler: Some(dointvec_minmax::<T>),
+                        poll: core::ptr::null_mut(),
+                        extra1: &data.min as *const _ as *mut c_void,
+                        extra2: &data.max as *const _ as *mut c_void,
+                    },
+                    ctl_table {
+                        procname: core::ptr::null(),
+                        data: core::ptr::null_mut(),
+                        maxlen: 0,
+                        mode: 0,
+                        child: core::ptr::null_mut(),
+                        proc_handler: None,
+                        poll: core::ptr::null_mut(),
+                        extra1: core::ptr::null_mut(),
+                        extra2: core::ptr::null_mut(),
+                    },
+                ]),
                 _marker: PhantomData,
             }
         }
 
-        pub const fn get_value(&self) -> c_int {
-            self.val
-        }
-
-        #[link_section = ".init.text"]
-        pub unsafe fn init(
-            &'static self,
-            name: &'static CStr,
-            mode: u16,
-            init_ctx: InitContextRef<'_>,
-        ) {
-            // SAFETY: intialization in init context
-            let r = unsafe { &mut *self.sysctl_table.get(init_ctx) };
-            *r = Some([
-                ctl_table {
-                    procname: name.as_char_ptr(),
-                    data: &self.val as *const _ as *mut c_void,
-                    maxlen: core::mem::size_of::<c_int>() as i32,
-                    mode: mode as _,
-                    child: core::ptr::null_mut(),
-                    proc_handler: Some(SysctlDoIntVecMinMax::<T>::dointvec_minmax),
-                    poll: core::ptr::null_mut(),
-                    extra1: &self.min as *const _ as *mut c_void,
-                    extra2: &self.max as *const _ as *mut c_void,
-                },
-                ctl_table {
-                    procname: core::ptr::null(),
-                    data: core::ptr::null_mut(),
-                    maxlen: 0,
-                    mode: 0,
-                    child: core::ptr::null_mut(),
-                    proc_handler: None,
-                    poll: core::ptr::null_mut(),
-                    extra1: core::ptr::null_mut(),
-                    extra2: core::ptr::null_mut(),
-                },
-            ])
-        }
-
         pub fn register(&'static self) {
-            if let Some(t) = self.sysctl_table.get_ref() {
-                let sret = unsafe {
-                    register_sysctl_paths(
-                        self.sysctl_path.as_ptr() as *const _,
-                        t as *const _ as *mut _,
-                    )
-                };
-            }
+            let sret = unsafe {
+                register_sysctl_paths(
+                    self.sysctl_path.as_ptr() as *const _,
+                    self.sysctl_table.get() as *mut _,
+                )
+            };
         }
     }
 
-    unsafe impl<T: SysctlIntHooks> Sync for SysctlInt<T> {}
+    // stored pointers are never dereferenced/leaked in type's interface
+    unsafe impl<T: SysctlIntWriteHook> Sync for SysctlInt<T> {}
 }
