@@ -36,9 +36,9 @@ init_static_work_struct! {
 }
 
 static PTRACE_SCOPE: BoundedInt = BoundedInt::new(
-    PtraceScope::default(),
-    PtraceScope::min(),
-    PtraceScope::max(),
+    YAMA_RUST_SCOPE_RELATIONAL,
+    YAMA_RUST_SCOPE_DISABLED,
+    YAMA_RUST_SCOPE_NO_ATTACH,
 );
 
 static PTRACE_SCOPE_SYSCTL_ENTRY: SysctlInt<PtraceScopeWriteHook> = SysctlInt::init(
@@ -54,7 +54,7 @@ struct PtraceRelationListCleanup;
 
 impl StaticWorkFunc for PtraceRelationListCleanup {
     fn work_func() {
-        pr_info!("Relation cleanup from work queue!\n");
+        //pr_info!("Relation cleanup from work queue!\n");
         PTRACER_RELATIONS.cleanup_relations();
     }
 }
@@ -67,7 +67,9 @@ struct AccessReportInfo {
 
 struct ReportAccess;
 
-impl DynamicWorkFunc<AccessReportInfo> for ReportAccess {
+impl DynamicWorkFunc for ReportAccess {
+    type AssociatedDataType = AccessReportInfo;
+
     fn work_func(data: &AccessReportInfo) {
         let target_cmdline = data.target.get_ref().get_cmdline_str();
         let agent_cmdline = data.agent.get_ref().get_cmdline_str();
@@ -92,7 +94,7 @@ impl DynamicWorkFunc<AccessReportInfo> for ReportAccess {
     }
 }
 
-type ReportAccessTask = DynamicWorkStruct<AccessReportInfo, ReportAccess>;
+type ReportAccessTask = DynamicWorkStruct<ReportAccess>;
 
 fn report_access(access: &'static CStr, target: TaskStructRef<'_>, agent: TaskStructRef<'_>) {
     let info = AccessReportInfo {
@@ -101,54 +103,62 @@ fn report_access(access: &'static CStr, target: TaskStructRef<'_>, agent: TaskSt
         agent: agent.get_task_struct(),
     };
 
-    if let Some(current) = TaskStruct::current() {
-        if current.get_ref().flags_set(PF_KTHREAD) {
-            ReportAccess::work_func(&info);
-        } else {
-            ReportAccessTask::create_and_schedule(info);
-        }
-    }   
-}
-
-#[derive(Copy, Clone)]
-enum PtraceScope {
-    Disabled = 0,
-    Relational = 1,
-    Capability = 2,
-    NoAttach = 3,
-}
-
-impl PtraceScope {
-    pub(crate) const fn max() -> i32 {
-        PtraceScope::NoAttach as i32
-    }
-
-    pub(crate) const fn min() -> i32 {
-        PtraceScope::Disabled as i32
-    }
-
-    pub(crate) const fn default() -> i32 {
-        PtraceScope::Relational as i32
-    }
-
-    pub(crate) fn from_int(x: i32) -> Option<PtraceScope> {
-        if x == PtraceScope::Disabled as i32 {
-            Some(PtraceScope::Disabled)
-        } else if x == PtraceScope::Relational as i32 {
-            Some(PtraceScope::Relational)
-        } else if x == PtraceScope::Capability as i32 {
-            Some(PtraceScope::Capability)
-        } else if x == PtraceScope::NoAttach as i32 {
-            Some(PtraceScope::NoAttach)
-        } else {
-            None
-        }
-    }
-
-    pub(crate) const fn to_int(&self) -> i32 {
-        *self as i32
+    let current = unsafe { TaskStructRef::current() };
+    if current.flags_set(PF_KTHREAD) {
+        ReportAccess::work_func(&info);
+    } else {
+        ReportAccessTask::create_and_schedule(info);
     }
 }
+
+// #[derive(Copy, Clone)]
+// enum PtraceScope {
+//     Disabled = 0,
+//     Relational = 1,
+//     Capability = 2,
+//     NoAttach = 3,
+// }
+
+const YAMA_RUST_SCOPE_DISABLED: i32 = 0;
+const YAMA_RUST_SCOPE_RELATIONAL: i32 = 1;
+const YAMA_RUST_SCOPE_CAPABILITY: i32 = 2;
+const YAMA_RUST_SCOPE_NO_ATTACH: i32 = 3;
+
+// impl PtraceScope {
+//     pub(crate) const fn max() -> i32 {
+//         PtraceScope::NoAttach as i32
+//     }
+
+//     pub(crate) const fn min() -> i32 {
+//         PtraceScope::Disabled as i32
+//     }
+
+//     pub(crate) const fn default() -> i32 {
+//         PtraceScope::Relational as i32
+//     }
+
+//     pub(crate) fn from_int(x: i32) -> PtraceScope {
+//         match x {
+            
+//         }
+//         if x <= >
+//         if x == PtraceScope::Disabled as i32 {
+//             Some(PtraceScope::Disabled)
+//         } else if x == PtraceScope::Relational as i32 {
+//             Some(PtraceScope::Relational)
+//         } else if x == PtraceScope::Capability as i32 {
+//             Some(PtraceScope::Capability)
+//         } else if x == PtraceScope::NoAttach as i32 {
+//             Some(PtraceScope::NoAttach)
+//         } else {
+//             None
+//         }
+//     }
+
+//     pub(crate) const fn to_int(&self) -> i32 {
+//         *self as i32
+//     }
+// }
 
 struct PtraceScopeWriteHook;
 
@@ -228,6 +238,7 @@ impl PtraceRelationNode {
 }
 
 impl GetRCUHead for PtraceRelationNode {
+    #[inline]
     fn get_rcu_head(&self) -> &RCUHead {
         &self.rcu_head
     }
@@ -236,6 +247,7 @@ impl GetRCUHead for PtraceRelationNode {
 impl RCUGetLinks for PtraceRelationNode {
     type EntryType = PtraceRelationNode;
 
+    #[inline]
     fn get_links(data: &Self::EntryType) -> &RCULinks<Self::EntryType> {
         &data.links
     }
@@ -400,37 +412,37 @@ impl PtraceRelationList {
         &self,
         tracer_task: TaskStructRef<'_>,
         tracee_task: TaskStructRef<'_>,
+        ctx: RCUReadLockRef<'_>,
     ) -> bool {
-        with_rcu_read_lock(|ctx| {
-            let mut tracee_task = tracee_task;
-            let parent = tracee_task.get_ptrace_parent(ctx);
-            if let Some(p) = parent {
-                if p.same_thread_group(tracer_task) {
-                    // pr_info!("Parent: {}, tracer: {}\n", p.pid(), p.pid());
-                    // pr_info!("Existing trace relationship!\n");
-                    return true;
-                }
+        let a = unsafe { ktime_get() };
+        let mut tracee_task = tracee_task;
+        let parent = tracee_task.get_ptrace_parent(ctx);
+        if let Some(p) = parent {
+            if p.same_thread_group(tracer_task) {
+                // pr_info!("Parent: {}, tracer: {}\n", p.pid(), p.pid());
+                // pr_info!("Existing trace relationship!\n");
+                let b = unsafe { ktime_get() };
+                pr_info!("exception found time: {}\n", b-a);
+                return true;
             }
+        }
 
-            if !tracee_task.thread_group_leader() {
-                tracee_task = tracee_task.get_thread_group_leader(ctx).unwrap();
+        tracee_task = tracee_task.get_thread_group_leader(ctx);
+
+        // get reference to list: safe as accesses will be read only RCU
+        let list = unsafe { &*self.list.get() };
+
+        // get a cursor pointing to the first element of the list
+        let mut cursor = list.cursor_front_rcu(ctx);
+        // unwrap each element of the list in turn, moving the cursor along
+        while let Some(relation_node) = cursor.current() {
+            if relation_node.matches_tracee(tracer_task, tracee_task, ctx) {
+                return true;
             }
+            cursor.move_next_rcu();
+        }
 
-            // get reference to list: safe as accesses will be read only RCU
-            let list = unsafe { &*self.list.get() };
-
-            // get a cursor pointing to the first element of the list
-            let mut cursor = list.cursor_front_rcu(ctx);
-            // unwrap each element of the list in turn, moving the cursor along
-            while let Some(relation_node) = cursor.current() {
-                if relation_node.matches_tracee(tracer_task, tracee_task, ctx) {
-                    return true;
-                }
-                cursor.move_next_rcu();
-            }
-
-            return false;
-        })
+        return false;
     }
 }
 
@@ -441,63 +453,81 @@ impl SecurityModule for YamaRust {
     fn ptrace_access_check(child: TaskStructRef<'_>, mode: c_uint) -> Result {
         // pr_info!("Ptrace access check!\n");
 
+        // static mut times: [i64; 1000] = [0; 1000];
+        // static mut times_count: usize = 0;
+
+        let a = unsafe { ktime_get() };
+        // let b = unsafe { ktime_get() };
+        // pr_info!("time time: {}\n", b-a);
+        
         let mut ret = Ok(());
+        let current = unsafe { TaskStructRef::current() };
 
         if (mode & PTRACE_MODE_ATTACH) != 0 {
             // pr_info!("Ptrace attach!\n");
 
-            match PtraceScope::from_int(PTRACE_SCOPE.get_val()) {
-                Some(PtraceScope::Disabled) => {
+            match PTRACE_SCOPE.get_val() {
+                YAMA_RUST_SCOPE_DISABLED => {
                     ret = Ok(());
                 }
-                Some(PtraceScope::Relational) => {
-                    ret = with_rcu_read_lock(|ctx| {
-                        let child_alive = child.pid_alive();
-                        let is_descendant = TaskStruct::current()
-                            .unwrap()
-                            .get_ref()
-                            .is_descendant(child, ctx);
-                        let exception_found = PTRACER_RELATIONS.exception_found(
-                            TaskStruct::current().unwrap().get_ref(),
-                            child,
-                        );
-                        let has_capability = child.current_ns_capable(CAP_SYS_PTRACE, ctx);
-                        // pr_info!(
-                        //     "Alive: {}, Capability: {}, Is Descendant: {}, Exception: {}\n",
-                        //     child_alive,
-                        //     has_capability,
-                        //     is_descendant,
-                        //     exception_found
-                        // );
-                        if child_alive && !is_descendant && !exception_found && !has_capability {
-                            pr_info!("Denied!\n");
-                            Err(Error::EPERM)
-                        } else {
-                            Ok(())
-                        }
-                    });
+                YAMA_RUST_SCOPE_RELATIONAL => {
+                    // let b = unsafe { ktime_get() };
+                    let lock = RCUReadLock::lock();
+                    let ctx = lock.get_ref();
+
+                    if !child.pid_alive() {
+                        ret = Err(Error::EPERM)
+                    }
+                    if ret.is_ok() && 
+                        !current.is_descendant(child, ctx) &&
+                        !PTRACER_RELATIONS.exception_found(current, child, ctx) &&
+                        !child.current_ns_capable(CAP_SYS_PTRACE, ctx)
+                    {
+                        // pr_info!("Denied!\n");
+                        ret = Err(Error::EPERM)
+                    }
+                    // });
                 }
-                Some(PtraceScope::Capability) => {
+                YAMA_RUST_SCOPE_CAPABILITY => {
                     ret = with_rcu_read_lock(|ctx| {
                         let has_capability = child.current_ns_capable(CAP_SYS_PTRACE, ctx);
                         if !has_capability {
-                            pr_info!("Denied!\n");
+                            // pr_info!("Denied!\n");
                             Err(Error::EPERM)
                         } else {
                             Ok(())
                         }
                     });
                 }
-                Some(PtraceScope::NoAttach) => {
-                    pr_info!("Denied!\n");
+                YAMA_RUST_SCOPE_NO_ATTACH => {
+                    // pr_info!("Denied!\n");
                     ret = Err(Error::EPERM);
                 }
                 _ => {
-                    pr_info!("Denied!\n");
+                    // pr_info!("Denied!\n");
                     ret = Err(Error::EPERM);
                 }
             }
         }
+
+        if ret.is_err() && (mode & PTRACE_MODE_NOAUDIT == 0) {
+            report_access(c_str!("attach"), current, child);
+        }
+
+        let b = unsafe { ktime_get() };
+
+        pr_info!("ptrace_access_check time: {}\n", b-a);
+        
+        // unsafe {
+        //     times[times_count] = b-a;
+        //     times_count += 1;
+        //     if times_count == 1000 {
+        //         for i in 0..1000 {
+        //             pr_info!("ptrace_access_check time: {}\n", times[i]);
+        //         }
+        //         times_count = 0;
+        //     }
+        // }
 
         return ret;
     }
@@ -505,23 +535,26 @@ impl SecurityModule for YamaRust {
     fn ptrace_traceme(parent: TaskStructRef<'_>) -> Result {
         let mut ret = Ok(());
 
-        if let Some(PtraceScope::Capability) = PtraceScope::from_int(PTRACE_SCOPE.get_val()) {
-            let has_capability = parent.has_ns_capability_current(CAP_SYS_PTRACE);
-            if !has_capability {
-                ret = Err(Error::EPERM);
+        match PTRACE_SCOPE.get_val() {
+            YAMA_RUST_SCOPE_CAPABILITY => {
+                let has_capability = parent.has_ns_capability_current(CAP_SYS_PTRACE);
+                if !has_capability {
+                    ret = Err(Error::EPERM);
+                    pr_info!("Traceme denied!\n");
+                }
+            },
+            YAMA_RUST_SCOPE_NO_ATTACH => {
                 pr_info!("Traceme denied!\n");
+                ret = Err(Error::EPERM);
+            },
+            _ => {
+                // pr_info!("Traceme permitted!\n");
             }
-        } else if let Some(PtraceScope::NoAttach) = PtraceScope::from_int(PTRACE_SCOPE.get_val())
-        {
-            pr_info!("Traceme denied!\n");
-            ret = Err(Error::EPERM);
-        } else {
-            // pr_info!("Traceme permitted!\n");
         }
 
-        let current = TaskStruct::current().unwrap();
+        let current = unsafe { TaskStructRef::current() };
 
-        report_access(c_str!("Traceme"), parent, current.get_ref());
+        report_access(c_str!("traceme"), parent, current);
 
         return ret;
     }
@@ -539,22 +572,51 @@ impl SecurityModule for YamaRust {
         _arg5: c_ulong,
     ) -> Result {
 
+        
+        // static mut times: [i64; 1000] = [0; 1000];
+        // static mut times_count: usize = 0;
+        unsafe { rcu_read_lock_exported() };
+        
         let a = unsafe { ktime_get() };
+
+        let mut x = 1234;
+        let mut y = 5678;
+        let mut p = &mut x as *mut _;
+
+
+        for i in 0..1000 {
+            unsafe {
+                // rcu_read_lock_exported();
+                // rcu_dereference_exported(&mut p as *mut *mut _ as *mut *mut c_void);
+                rcu_assign_pointer_exported(&mut p as *mut *mut _ as *mut *mut c_void, &mut x as *mut _ as *mut _);
+                // rcu_assign_pointer_exported(&mut p as *mut *mut _ as *mut *mut c_void, &mut y as *mut _ as *mut _);
+                // rcu_read_unlock_exported();
+            }
+        }
+
+        let b = unsafe { ktime_get() };
+
+        pr_info!("time: {}\n", b-a);
+
+        unsafe { rcu_read_unlock_exported() };
+
+        // for i in 0..1000 {
+        //     unsafe {
+        //         // rcu_read_lock_exported();
+        //         // rcu_dereference_exported(&mut p as *mut *mut _ as *mut *mut c_void);
+        //         // rcu_assign_pointer_exported(&mut p as *mut *mut _ as *mut *mut c_void, &mut x as *mut _ as *mut _);
+        //         // rcu_assign_pointer_exported(&mut p as *mut *mut _ as *mut *mut c_void, &mut y as *mut _ as *mut _);
+        //         rcu_read_unlock_exported();
+        //     }
+        // }
+
         
         let mut ret = Err(Error::ENOSYS);
 
         if option == PR_SET_PTRACER as c_int {
             let myself = with_rcu_read_lock(|ctx| {
-                let current = TaskStruct::current().unwrap();
-                if current.get_ref().thread_group_leader() {
-                    current
-                } else {
-                    current
-                        .get_ref()
-                        .get_thread_group_leader(ctx)
-                        .unwrap()
-                        .get_task_struct()
-                }
+                let current = unsafe { TaskStructRef::current() };
+                current.get_thread_group_leader(ctx).get_task_struct()
             });
 
             // no tracing permitted
@@ -583,8 +645,21 @@ impl SecurityModule for YamaRust {
             }
         }
 
-        let b = unsafe { ktime_get() };
-        pr_info!("prctl time: {}\n", b-a);
+        // let b = unsafe { ktime_get() };
+
+        // unsafe {
+        //     times[times_count] = b-a;
+        //     times_count += 1;
+        //     if times_count == 1000 {
+        //         for i in 0..1000 {
+        //             pr_info!("prctl time: {}\n", times[i]);
+        //         }
+        //         times_count = 0;
+        //     }
+        // }
+
+        
+        // pr_info!("prctl time: {}\n", b-a);
 
         return ret;
     }

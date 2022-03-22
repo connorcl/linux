@@ -299,10 +299,10 @@ pub mod security_module {
             // log prefix for kernel print
             const __LOG_PREFIX: &[u8] = $crate::c_str!($name).as_bytes_with_nul();
 
-            const i: usize = kernel::count!($($security_hook)*);
+            const __lsm_hook_count: usize = kernel::count!($($security_hook)*);
 
             // the raw list of security hooks
-            static mut __lsm_hooks_raw: [security_hook_list; i] = [
+            static mut __lsm_hooks_raw: [security_hook_list; __lsm_hook_count] = [
                 $(
                     security_hook_list {
                         // hook location: bprm_check_security
@@ -384,7 +384,7 @@ pub mod rcu {
         // get a zero-size 'reference' type that behaves as if
         // if holds a reference to self, enforcing that this reference
         // does not outlive self
-        pub fn get_ref<'a>(&'a self) -> RCUReadLockRef<'a> {
+        pub const fn get_ref<'a>(&'a self) -> RCUReadLockRef<'a> {
             RCUReadLockRef {
                 _phantom: PhantomData,
             }
@@ -410,14 +410,17 @@ pub mod rcu {
         f(ctx.get_ref())
     }
 
+    #[inline]
     pub(crate) unsafe  fn rcu_dereference<T>(p: *mut *mut T, _ctx: RCUReadLockRef<'_>) -> *mut T {
         unsafe { rcu_dereference_exported(p as *mut *mut c_void) as *mut T }
     }
 
+    #[inline]
     pub(crate) unsafe fn rcu_dereference_const<T>(p: *const *const T, _ctx: RCUReadLockRef<'_>) -> *const T {
         unsafe { rcu_dereference_exported(p as *mut *mut c_void) as *const T }
     }
 
+    #[inline]
     pub(crate) unsafe fn rcu_assign_pointer<T>(p: *mut *mut T, v: *mut T, _ctx: RCUReadLockRef<'_>) {
         unsafe {
             rcu_assign_pointer_exported(p as *mut *mut c_void, v as *mut c_void);
@@ -915,14 +918,14 @@ pub mod task {
             TaskStruct::from_ptr(ptr)
         }
 
-        pub fn get_ref<'a>(&'a self) -> TaskStructRef<'a> {
+        pub const fn get_ref<'a>(&'a self) -> TaskStructRef<'a> {
             TaskStructRef {
                 ptr: self.ptr,
                 _marker: PhantomData,
             }
         }
 
-        pub fn get_id(&self) -> TaskStructID {
+        pub const fn get_id(&self) -> TaskStructID {
             TaskStructID { ptr: self.ptr }
         }
     }
@@ -979,34 +982,52 @@ pub mod task {
             Some(TaskStructRef { ptr: p, _marker: PhantomData })
         }
 
+        pub unsafe fn current() -> TaskStructRef<'a> {
+            let p = unsafe {
+                NonNull::new_unchecked(get_current_exported())
+            };
+            TaskStructRef {
+                ptr: p,
+                _marker: PhantomData,
+            }
+        }
+
+        #[inline]
         pub fn get_task_struct(self) -> TaskStruct {
             TaskStruct::from_nonnull(self.ptr)
         }
 
-        pub fn get_id(self) -> TaskStructID {
+        #[inline]
+        pub const fn get_id(self) -> TaskStructID {
             TaskStructID { ptr: self.ptr }
         }
 
-        pub fn pid(self) -> pid_t {
+        #[inline]
+        pub const fn pid(self) -> pid_t {
             unsafe { (*self.ptr.as_ptr()).pid }
         }
 
+        #[inline]
         pub fn same_thread_group(self, other: TaskStructRef<'_>) -> bool {
             unsafe { (*self.ptr.as_ptr()).signal == (*other.ptr.as_ptr()).signal }
         }
 
+        #[inline]
         pub fn thread_group_leader(self) -> bool {
             unsafe { (*self.ptr.as_ptr()).exit_signal >= 0 }
         }
 
+        #[inline]
         pub fn pid_alive(self) -> bool {
             unsafe { (*self.ptr.as_ptr()).thread_pid != core::ptr::null_mut() }
         }
 
+        #[inline]
         pub fn flags_set(self, flags: u32) -> bool {
             unsafe { (*self.ptr.as_ptr()).flags & flags != 0 }
         }
 
+        #[inline]
         pub fn current_ns_capable(self, cap: u32, ctx: RCUReadLockRef<'_>) -> bool {
             let task_cred = unsafe {
                 rcu_dereference_const(&(*self.ptr.as_ptr()).real_cred as *const *const cred, ctx)
@@ -1014,6 +1035,7 @@ pub mod task {
             unsafe { ns_capable_exported((*task_cred).user_ns, cap.try_into().unwrap()) >= 0 }
         }
 
+        #[inline]
         pub fn has_ns_capability_current(self, cap: u32) -> bool {
             unsafe {
                 has_ns_capability(
@@ -1040,28 +1062,39 @@ pub mod task {
             }
         }
 
+        #[inline]
         pub fn get_real_parent(
             self,
             ctx: RCUReadLockRef<'a>,
-        ) -> Option<TaskStructRef<'a>> {
+        ) -> TaskStructRef<'a> {
             let ptr = unsafe {
                 rcu_dereference(&mut (*self.ptr.as_ptr()).real_parent as *mut *mut _, ctx)
             };
-            let ptr = NonNull::new(ptr)?; 
-            Some(TaskStructRef { ptr, _marker: PhantomData, })
+            if ptr == core::ptr::null_mut() {
+                self
+            } else {
+                let ptr = unsafe { NonNull::new_unchecked(ptr) };
+                TaskStructRef { ptr,  _marker: PhantomData }
+            }
         }
 
+        #[inline]
         pub fn get_thread_group_leader(
             self,
             ctx: RCUReadLockRef<'a>,
-        ) -> Option<TaskStructRef<'a>> {
+        ) -> TaskStructRef<'a> {
             let ptr = unsafe {
                 rcu_dereference(&mut (*self.ptr.as_ptr()).group_leader as *mut *mut _, ctx)
             };
-            let ptr = NonNull::new(ptr)?;
-            Some(TaskStructRef { ptr, _marker: PhantomData, })
+            if ptr == core::ptr::null_mut() || self.thread_group_leader() {
+                self
+            } else {
+                let ptr = unsafe { NonNull::new_unchecked(ptr) };
+                TaskStructRef { ptr,  _marker: PhantomData }
+            }
         }
 
+        #[inline]
         pub fn get_ptrace_parent(
             self,
             ctx: RCUReadLockRef<'a>,
@@ -1073,28 +1106,28 @@ pub mod task {
         }
 
         pub fn is_descendant(self, child: TaskStructRef<'_>, ctx: RCUReadLockRef<'_>) -> bool {
-            let parent = if self.thread_group_leader() {
-                self
-            } else {
-                self.get_thread_group_leader(ctx).unwrap()
-            };
+            // let a = unsafe { ktime_get() };
+            let parent = self.get_thread_group_leader(ctx);
             let mut walker = child;
 
+            // let mut count = 0;
             while walker.pid() > 0 {
-                walker = if walker.thread_group_leader() {
-                    walker
-                } else {
-                    walker.get_thread_group_leader(ctx).unwrap()
-                };
+                // count += 1;
+                walker = walker.get_thread_group_leader(ctx);
                 if walker == parent {
+                    // let b = unsafe { ktime_get() };
+                    // crate::pr_info!("t is_descendant time: {}\n", b-a);
                     return true;
                 }
-                walker = walker.get_real_parent(ctx).unwrap();
+                walker = walker.get_real_parent(ctx);
             }
+            // let b = unsafe { ktime_get() };
+            // crate::pr_info!("is_descendant time: {}\n", b-a);
             return false;
         }
     }
 
+    #[inline]
     pub fn current_capable(cap: i32) -> bool {
         unsafe { capable_exported(cap) }
     }
@@ -1165,38 +1198,45 @@ pub mod work_queue {
     // this type's methods do not read or write any of its data
     unsafe impl<T: StaticWorkFunc> Sync for StaticWorkStruct<T> {}
 
-    pub trait DynamicWorkFunc<T> {
-        fn work_func(data: &T);
+    pub trait DynamicWorkFunc {
+        type AssociatedDataType;
+
+        fn work_func(data: &Self::AssociatedDataType);
     }
 
-    unsafe extern "C" fn dynamic_work_func<T, U: DynamicWorkFunc<T>>(work: *mut callback_head) {
+    unsafe extern "C" fn dynamic_work_func<T: DynamicWorkFunc>(work: *mut callback_head) {
         // SAFETY: callback_head pts to field of Box-allocated work payload
         let payload = unsafe {
-            Box::from_raw(container_of!(work, DynamicWorkStruct<T, U>, work_head)
-                as *mut DynamicWorkStruct<T, U>)
+            Box::from_raw(container_of!(work, DynamicWorkStruct<T>, work_head)
+                as *mut DynamicWorkStruct<T>)
         };
-        U::work_func(&(*payload).data);
+        T::work_func(&(*payload).data);
         // box goes out of scope and dynamicaly allocated payload is freed
     }
     
-    pub struct DynamicWorkStruct<T, U: DynamicWorkFunc<T>> {
-        data: T,
+    pub struct DynamicWorkStruct<T: DynamicWorkFunc> {
+        data: T::AssociatedDataType,
         work_head: callback_head,
-        _marker: PhantomData<U>,
+        // _marker: PhantomData<U>,
     }
 
-    impl<T, U: DynamicWorkFunc<T>> DynamicWorkStruct<T, U> {
-        pub fn create_and_schedule(data: T) {
+    impl<T: DynamicWorkFunc> DynamicWorkStruct<T> {
+        pub fn create_and_schedule(data: T::AssociatedDataType) {
             // dynamically allocate a new payload
-            let payload: Box<DynamicWorkStruct<T, U>> = Box::try_new(DynamicWorkStruct {
+            let payload: Box<DynamicWorkStruct<T>> = Box::try_new(DynamicWorkStruct {
                 data: data,
                 work_head: callback_head {
                     next: core::ptr::null_mut(),
-                    func: Some(dynamic_work_func::<T, U>),
+                    func: Some(dynamic_work_func::<T>),
                 },
-                _marker: PhantomData,
-            })
-            .unwrap();
+                // _marker: PhantomData,
+            }).unwrap();
+            // match payload {
+            //     Ok(p) => {
+
+            //     },
+            //     Err(e)
+            // }
             // covert to raw pointer to prevent drop
             let payload = Box::into_raw(payload);
 
@@ -1225,6 +1265,7 @@ pub mod sysctl {
     use core::marker::PhantomData;
     use core::cell::UnsafeCell;
 
+    #[repr(transparent)]
     pub struct SysctlPath(ctl_path);
 
     impl SysctlPath {
@@ -1252,7 +1293,8 @@ pub mod sysctl {
             ]
         }
     }
-
+    
+    #[repr(transparent)]
     pub struct SysctlTable(ctl_table);
 
     impl SysctlTable {
