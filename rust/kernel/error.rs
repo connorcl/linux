@@ -349,6 +349,7 @@ impl Error {
     }
 
     /// Returns the kernel error code.
+    #[inline]
     pub fn to_kernel_errno(self) -> c_types::c_int {
         self.0
     }
