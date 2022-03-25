@@ -10,9 +10,9 @@
 /// The types in this module center around a zero-sized
 /// reference type which can be used to confirm execution
 /// is still in the initialization phase.
-pub mod init_context {
+pub mod context {
 
-    use core::cell::UnsafeCell;
+    // use core::cell::UnsafeCell;
     use core::marker::PhantomData;
 
     /// RAII object representing init context
@@ -33,7 +33,8 @@ pub mod init_context {
         /// of this struct do not outlive the init phase. There may be a
         /// better way to do this...
         #[link_section = ".init.text"]
-        pub unsafe fn new() -> InitContext {
+        #[inline]
+        pub const unsafe fn new() -> InitContext {
             InitContext {
                 _private: (),
             }
@@ -44,10 +45,11 @@ pub mod init_context {
         /// These 'references' can be freely copied and passed around as
         /// arguments, and the compiler will ensure they do not outlive the
         ///  `InitContext` they refer to
-        pub fn get_ref<'a>(&'a self) -> InitContextRef<'a> {
-            return InitContextRef {
+        #[inline]
+        pub const fn get_ref<'a>(&'a self) -> InitContextRef<'a> {
+             InitContextRef {
                 _marker: PhantomData,
-            };
+            }
         }
     }
 
@@ -63,44 +65,62 @@ pub mod init_context {
         _marker: PhantomData<&'a InitContext>,
     }
 
-    /// A cell which only allows mutable access during initialization
-    ///
-    /// This type is a simple layer over `UnsafeCell` which only allows
-    /// gaining a raw pointer to the underlying data if an `InitContextRef`
-    /// is provided, confirming execution is in the initialization stage.
-    ///
-    /// This is useful for initializing data which cannot be initialized
-    /// statically, providing a safer option than a simple UnsafeCell
-    pub struct InitCell<T> {
-        data: UnsafeCell<T>,
+    pub struct EventContext {
+        _private: (),
     }
 
-    impl<T> InitCell<T> {
-        /// Returns a new `InitCell`
-        ///
-        /// This simply initializes the underlying `UnsafeCell`
-        pub const fn new(data: T) -> InitCell<T> {
-            InitCell {
-                data: UnsafeCell::new(data),
+    impl EventContext {
+        #[inline]
+        pub const unsafe fn new() -> Self {
+            Self {
+                _private: (),
             }
         }
 
-        /// Returns a raw pointer to the underlying data
-        ///
-        /// # Arguments
-        ///
-        /// * _init_ctx: An `InitContextRef` to confirm execution is in
-        /// the intiialization phase.
-        #[link_section = ".init.text"]
-        pub const fn get(&self, _init_ctx: InitContextRef<'_>) -> *mut T {
-            self.data.get()
-        }
-
-        /// Returns an immutable reference to the underlying data
-        pub const fn get_ref(&self) -> &T {
-            unsafe { &*self.data.get() }
+        #[inline]
+        pub const fn get_ref<'a>(&'a self) -> EventContextRef<'a> {
+            EventContextRef {
+                _marker: PhantomData,
+            }
         }
     }
+
+    #[derive(Copy, Clone)]
+    pub struct EventContextRef<'a> {
+        _marker: PhantomData<&'a EventContext>,
+    }
+
+    
+    // pub struct InitCell<T> {
+    //     data: UnsafeCell<T>,
+    // }
+
+    // impl<T> InitCell<T> {
+    //     /// Returns a new `InitCell`
+    //     ///
+    //     /// This simply initializes the underlying `UnsafeCell`
+    //     pub const fn new(data: T) -> InitCell<T> {
+    //         InitCell {
+    //             data: UnsafeCell::new(data),
+    //         }
+    //     }
+
+    //     /// Returns a raw pointer to the underlying data
+    //     ///
+    //     /// # Arguments
+    //     ///
+    //     /// * _init_ctx: An `InitContextRef` to confirm execution is in
+    //     /// the intiialization phase.
+    //     #[link_section = ".init.text"]
+    //     pub const fn get(&self, _init_ctx: InitContextRef<'_>) -> *mut T {
+    //         self.data.get()
+    //     }
+
+    //     /// Returns an immutable reference to the underlying data
+    //     pub const fn get_ref(&self) -> &T {
+    //         unsafe { &*self.data.get() }
+    //     }
+    // }
 }
 
 /// Abstractions to the Linux security module subsystem
@@ -113,7 +133,7 @@ pub mod security_module {
     use crate::c_types::*;
     use crate::prelude::*;
     use crate::str::CStr;
-    use crate::yama_rust_interfaces::init_context::*;
+    use crate::yama_rust_interfaces::context::*;
     use crate::yama_rust_interfaces::task::TaskStructRef;
     use core::marker::PhantomData;
 
@@ -161,7 +181,7 @@ pub mod security_module {
         /// and this method only called within the security module `init` method,
         /// these conditions should be satisfied.
         #[link_section = ".init.text"]
-        pub unsafe fn register(&'static mut self, _init_ctx: InitContextRef<'_>) {
+        pub fn register(&'static mut self, _init_ctx: InitContextRef<'_>) {
             let hooks_ptr = self.hook_list.as_mut_ptr();
             let hooks_len = self.hook_list.len() as c_int;
             let name_ptr = self.lsm_name.as_char_ptr();
@@ -205,8 +225,9 @@ pub mod security_module {
             child: *mut task_struct,
             mode: c_uint,
         ) -> c_int {
-            let child = unsafe { TaskStructRef::from_ptr(&child).unwrap() };
-            match T::ptrace_access_check(child, mode) {
+            let event_ctx = unsafe { EventContext::new() };
+            let child = unsafe { TaskStructRef::from_ptr(child, event_ctx.get_ref()).unwrap() };
+            match T::ptrace_access_check(child, mode, event_ctx.get_ref()) {
                 Ok(_) => {
                     0
                 }
@@ -217,8 +238,9 @@ pub mod security_module {
         }
 
         pub unsafe extern "C" fn ptrace_traceme(parent: *mut task_struct) -> c_int {
-            let parent = unsafe { TaskStructRef::from_ptr(&parent).unwrap() };
-            match T::ptrace_traceme(parent) {
+            let event_ctx = unsafe { EventContext::new() };
+            let parent = unsafe { TaskStructRef::from_ptr(parent, event_ctx.get_ref()).unwrap() };
+            match T::ptrace_traceme(parent, event_ctx.get_ref()) {
                 Ok(_) => {
                     0
                 }
@@ -229,8 +251,9 @@ pub mod security_module {
         }
 
         pub unsafe extern "C" fn task_free(task: *mut task_struct) {
-            let task = unsafe { TaskStructRef::from_ptr(&task).unwrap() };
-            T::task_free(task);
+            let event_ctx = unsafe { EventContext::new() };
+            let task = unsafe { TaskStructRef::from_ptr(task, event_ctx.get_ref()).unwrap() };
+            T::task_free(task, event_ctx.get_ref());
         }
 
         pub unsafe extern "C" fn task_prctl(
@@ -240,7 +263,8 @@ pub mod security_module {
             arg4: c_ulong,
             arg5: c_ulong,
         ) -> c_int {
-            match T::task_prctl(option, arg2, arg3, arg4, arg5) {
+            let event_ctx = unsafe { EventContext::new() };
+            match T::task_prctl(option, arg2, arg3, arg4, arg5, event_ctx.get_ref()) {
                 Ok(_) => {
                     0
                 }
@@ -255,15 +279,15 @@ pub mod security_module {
 
         fn init(hooks: &'static mut SecurityHookList, init_ctx: InitContextRef<'_>) -> Result;
     
-        fn ptrace_access_check(_child: TaskStructRef<'_>, _mode: u32) -> Result {
+        fn ptrace_access_check(_child: TaskStructRef<'_>, _mode: u32, _event_ctx: EventContextRef<'_>) -> Result {
             Ok(())
         }
 
-        fn ptrace_traceme(_parent: TaskStructRef<'_>) -> Result {
+        fn ptrace_traceme(_parent: TaskStructRef<'_>, _event_ctx: EventContextRef<'_>) -> Result {
             Ok(())
         }
 
-        fn task_free(_task: TaskStructRef<'_>) { }
+        fn task_free(_task: TaskStructRef<'_>, _event_ctx: EventContextRef<'_>) { }
 
         fn task_prctl(
             _option: c_int,
@@ -271,6 +295,7 @@ pub mod security_module {
             _arg3: c_ulong,
             _arg4: c_ulong,
             _arg5: c_ulong,
+            _event_ctx: EventContextRef<'_>,
         ) -> Result {
             Ok(())
         }
@@ -333,7 +358,8 @@ pub mod security_module {
             #[link_section = ".init.text"]
             unsafe extern "C" fn __lsm_init_fn() -> c_int {
                 let init_ctx = unsafe { InitContext::new() };
-                let ret = unsafe { <$security_module>::init(&mut __lsm_hooks, init_ctx.get_ref()) };
+                let __lsm_hooks_ref = unsafe { &mut __lsm_hooks };
+                let ret = <$security_module>::init(__lsm_hooks_ref, init_ctx.get_ref());
                 match ret {
                     Ok(_) => {
                         0
@@ -374,6 +400,7 @@ pub mod rcu {
     }
 
     impl RCUReadLock {
+        #[inline]
         pub fn lock() -> RCUReadLock {
             unsafe {
                 rcu_read_lock_exported();
@@ -384,6 +411,7 @@ pub mod rcu {
         // get a zero-size 'reference' type that behaves as if
         // if holds a reference to self, enforcing that this reference
         // does not outlive self
+        #[inline]
         pub const fn get_ref<'a>(&'a self) -> RCUReadLockRef<'a> {
             RCUReadLockRef {
                 _phantom: PhantomData,
@@ -392,6 +420,7 @@ pub mod rcu {
     }
 
     impl Drop for RCUReadLock {
+        #[inline]
         fn drop(&mut self) {
             unsafe {
                 rcu_read_unlock_exported();
@@ -405,6 +434,7 @@ pub mod rcu {
         _phantom: PhantomData<&'a RCUReadLock>,
     }
 
+    #[inline]
     pub fn with_rcu_read_lock<T, F: FnOnce(RCUReadLockRef<'_>) -> T>(f: F) -> T {
         let ctx = RCUReadLock::lock();
         f(ctx.get_ref())
@@ -448,7 +478,8 @@ pub mod rcu {
     }
 
     impl RCUHead {
-        pub fn new() -> RCUHead {
+        #[inline]
+        pub const fn new() -> RCUHead {
             RCUHead {
                 head: callback_head {
                     next: core::ptr::null_mut(),
@@ -457,6 +488,7 @@ pub mod rcu {
             }
         }
 
+        #[inline]
         fn get(&self) -> *mut callback_head {
             &self.head as *const _ as *mut _
         }
@@ -563,6 +595,7 @@ pub mod rcu {
         }
 
         impl<T> RCULinks<T> {
+            #[inline]
             pub fn new() -> RCULinks<T> {
                 RCULinks {
                     entry: UnsafeCell::new(RCUListEntry {
@@ -573,6 +606,7 @@ pub mod rcu {
             }
 
             // rcu-dereference and return the pointer to the next element
+            #[inline]
             pub fn rcu_dereference_next(&self, ctx: RCUReadLockRef<'_>) -> *mut T {
                 let ptr_to_list_entry = self.entry.get();
                 let ptr_to_next_ptr = unsafe { &mut (*ptr_to_list_entry).next as *mut *mut T };
@@ -606,6 +640,7 @@ pub mod rcu {
                 }
             }
 
+            #[inline]
             pub fn cursor_front_rcu<'a, 'b>(&'a self, ctx: RCUReadLockRef<'b>) -> RCUListCursor<'a, 'b, T> {
                 RCUListCursor {
                     cur: NonNull::new(unsafe { rcu_dereference(
@@ -617,12 +652,13 @@ pub mod rcu {
                 }
             }
 
+            #[inline]
             pub fn cursor_front_mut_rcu<'a, 'b>(
                 &'a mut self,
                 ctx: RCUReadLockRef<'b>,
             ) -> RCUListCursorMut<'a, 'b, T> {
                 RCUListCursorMut {
-                    cur: NonNull::new(unsafe {rcu_dereference(
+                    cur: NonNull::new(unsafe { rcu_dereference(
                         &mut self.head as *mut *mut T::EntryType,
                         ctx,
                     )} ),
@@ -631,6 +667,7 @@ pub mod rcu {
                 }
             }
 
+            #[inline]
             pub fn cursor_front_inplace_mut_rcu<'a, 'b>(
                 &'a self,
                 ctx: RCUReadLockRef<'b>,
@@ -703,10 +740,12 @@ pub mod rcu {
         }
 
         impl<'a, 'b, T: RCUGetLinks + GetRCUHead> RCUListCursor<'a, 'b, T> {
+            #[inline]
             pub fn current(&self) -> Option<&T::EntryType> {
                 Some(unsafe { &*self.cur?.as_ptr() })
             }
 
+            #[inline]
             pub fn move_next_rcu(&mut self) {
                 if let Some(p) = self.cur {
                     let next_ptr =
@@ -723,10 +762,12 @@ pub mod rcu {
         }
 
         impl<'a, 'b, T: RCUGetLinks + GetRCUHead> RCUListCursorInplaceMut<'a, 'b, T> {
+            #[inline]
             pub fn current_mut(&mut self) -> Option<*mut T::EntryType> {
                 Some(self.cur?.as_ptr())
             }
 
+            #[inline]
             pub fn move_next_rcu(&mut self) {
                 if let Some(p) = self.cur {
                     let next_ptr =
@@ -743,14 +784,16 @@ pub mod rcu {
         }
 
         impl<'a, 'b, T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'a, 'b, T> {
+            #[inline]
             pub fn current(&self) -> Option<&T::EntryType> {
                 Some(unsafe { &*self.cur?.as_ptr() })
             }
 
+            #[inline]
             pub fn move_next_rcu(&mut self) {
                 if let Some(p) = self.cur {
                     let next_ptr =
-                        unsafe { T::get_links(&mut *p.as_ptr()).rcu_dereference_next(self.rcu_ctx) };
+                        unsafe { T::get_links(&*p.as_ptr()).rcu_dereference_next(self.rcu_ctx) };
                     self.cur = NonNull::new(next_ptr);
                 }
             }
@@ -883,6 +926,7 @@ pub mod task {
     use crate::yama_rust_interfaces::rcu::rcu_dereference_const;
     use crate::yama_rust_interfaces::rcu::with_rcu_read_lock;
     use crate::yama_rust_interfaces::rcu::RCUReadLockRef;
+    use crate::yama_rust_interfaces::context::*;
     use core::convert::TryInto;
     use core::marker::PhantomData;
     use core::ptr::NonNull;
@@ -893,6 +937,7 @@ pub mod task {
     }
 
     impl TaskStruct {
+        #[inline]
         pub(crate) fn from_ptr(ptr: *mut task_struct) -> Option<TaskStruct> {
             let p = NonNull::new(ptr)?;
             unsafe { 
@@ -901,6 +946,7 @@ pub mod task {
             Some(TaskStruct { ptr: p })
         }
 
+        #[inline]
         pub(crate) fn from_nonnull(ptr: NonNull<task_struct>) -> TaskStruct {
             unsafe {
                 get_task_struct_exported(ptr.as_ptr());
@@ -908,16 +954,19 @@ pub mod task {
             TaskStruct { ptr }
         }
 
+        #[inline]
         pub fn from_pid(pid: pid_t) -> Option<TaskStruct> {
             let ptr = unsafe { find_get_task_by_vpid(pid) };
             TaskStruct::from_ptr(ptr)
         }
 
+        #[inline]
         pub fn current() -> Option<TaskStruct> {
             let ptr = unsafe { get_current_exported() };
             TaskStruct::from_ptr(ptr)
         }
 
+        #[inline]
         pub const fn get_ref<'a>(&'a self) -> TaskStructRef<'a> {
             TaskStructRef {
                 ptr: self.ptr,
@@ -925,12 +974,14 @@ pub mod task {
             }
         }
 
+        #[inline]
         pub const fn get_id(&self) -> TaskStructID {
             TaskStructID { ptr: self.ptr }
         }
     }
 
     impl Drop for TaskStruct {
+        #[inline]
         fn drop(&mut self) {
             unsafe {
                 put_task_struct_exported(self.ptr.as_ptr());
@@ -946,19 +997,22 @@ pub mod task {
     impl TaskStructID {
         // get a task struct ref that is valid for rcu lock ctx
         // caller must ensure ptr is valid throughout rcu context!
-        pub unsafe fn get_tmp_ref(&self) -> TaskStructRef<'_> {
+        #[inline]
+        pub const unsafe fn get_tmp_ref(&self) -> TaskStructRef<'_> {
             TaskStructRef {
                 ptr: self.ptr,
                 _marker: PhantomData,
             }
         }
 
-        pub fn get_ptr(&self) -> *mut task_struct {
+        #[inline]
+        pub const fn get_ptr(&self) -> *mut task_struct {
             self.ptr.as_ptr()
         }
     }
 
     impl<'a> PartialEq for TaskStructID {
+        #[inline]
         fn eq(&self, other: &Self) -> bool {
             self.ptr == other.ptr
         }
@@ -971,18 +1025,21 @@ pub mod task {
     }
 
     impl<'a> PartialEq for TaskStructRef<'a> {
+        #[inline]
         fn eq(&self, other: &Self) -> bool {
             self.ptr == other.ptr
         }
     }
 
     impl<'a> TaskStructRef<'a> {
-        pub(crate) unsafe fn from_ptr<'b>(ptr: &'b *mut task_struct) -> Option<TaskStructRef<'b>> {
-            let p = NonNull::new(*ptr)?;
+        #[inline]
+        pub(crate) unsafe fn from_ptr(ptr: *mut task_struct, ctx: EventContextRef<'a>) -> Option<TaskStructRef<'a>> {
+            let p = NonNull::new(ptr)?;
             Some(TaskStructRef { ptr: p, _marker: PhantomData })
         }
 
-        pub unsafe fn current() -> TaskStructRef<'a> {
+        #[inline]
+        pub fn current(ctx: EventContextRef<'a>) -> TaskStructRef<'a> {
             let p = unsafe {
                 NonNull::new_unchecked(get_current_exported())
             };
@@ -1083,12 +1140,12 @@ pub mod task {
             self,
             ctx: RCUReadLockRef<'a>,
         ) -> TaskStructRef<'a> {
-            let ptr = unsafe {
-                rcu_dereference(&mut (*self.ptr.as_ptr()).group_leader as *mut *mut _, ctx)
-            };
-            if ptr == core::ptr::null_mut() || self.thread_group_leader() {
+            if self.thread_group_leader() {
                 self
             } else {
+                let ptr = unsafe {
+                    rcu_dereference(&mut (*self.ptr.as_ptr()).group_leader as *mut *mut _, ctx)
+                };
                 let ptr = unsafe { NonNull::new_unchecked(ptr) };
                 TaskStructRef { ptr,  _marker: PhantomData }
             }
@@ -1105,6 +1162,7 @@ pub mod task {
             Some(TaskStructRef { ptr, _marker: PhantomData, })
         }
 
+        #[inline]
         pub fn is_descendant(self, child: TaskStructRef<'_>, ctx: RCUReadLockRef<'_>) -> bool {
             // let a = unsafe { ktime_get() };
             let parent = self.get_thread_group_leader(ctx);
@@ -1138,7 +1196,7 @@ pub mod work_queue {
     use crate::bindings::*;
     use crate::container_of;
     use crate::prelude::*;
-    use crate::yama_rust_interfaces::init_context::*;
+    use crate::yama_rust_interfaces::context::*;
     use alloc::boxed::Box;
     use core::marker::PhantomData;
     use core::cell::UnsafeCell;
@@ -1261,7 +1319,7 @@ pub mod sysctl {
     use crate::prelude::*;
     use crate::str::CStr;
     use crate::c_str;
-    use crate::yama_rust_interfaces::init_context::{InitCell, InitContextRef};
+    use crate::yama_rust_interfaces::context::{InitContextRef};
     use core::marker::PhantomData;
     use core::cell::UnsafeCell;
 
@@ -1352,6 +1410,7 @@ pub mod sysctl {
             BoundedInt { val: UnsafeCell::new(val), min, max }
         }
 
+        #[inline]
         pub const fn get_val(&self) -> i32 { unsafe { *self.val.get() } }
     }
 

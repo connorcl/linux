@@ -8,7 +8,7 @@ use kernel::c_types::*;
 use kernel::gen_sysctl_path;
 use kernel::prelude::*;
 use kernel::sync::*;
-use kernel::yama_rust_interfaces::init_context::*;
+use kernel::yama_rust_interfaces::context::*;
 use kernel::yama_rust_interfaces::rcu::rcu_list::*;
 use kernel::yama_rust_interfaces::rcu::*;
 use kernel::yama_rust_interfaces::security_module::*;
@@ -96,14 +96,14 @@ impl DynamicWorkFunc for ReportAccess {
 
 type ReportAccessTask = DynamicWorkStruct<ReportAccess>;
 
-fn report_access(access: &'static CStr, target: TaskStructRef<'_>, agent: TaskStructRef<'_>) {
+fn report_access(access: &'static CStr, target: TaskStructRef<'_>, agent: TaskStructRef<'_>, event_ctx: EventContextRef<'_>) {
     let info = AccessReportInfo {
         access: access,
         target: target.get_task_struct(),
         agent: agent.get_task_struct(),
     };
 
-    let current = unsafe { TaskStructRef::current() };
+    let current = TaskStructRef::current(event_ctx);
     if current.flags_set(PF_KTHREAD) {
         ReportAccess::work_func(&info);
     } else {
@@ -414,15 +414,15 @@ impl PtraceRelationList {
         tracee_task: TaskStructRef<'_>,
         ctx: RCUReadLockRef<'_>,
     ) -> bool {
-        let a = unsafe { ktime_get() };
+        // let a = unsafe { ktime_get() };
         let mut tracee_task = tracee_task;
         let parent = tracee_task.get_ptrace_parent(ctx);
         if let Some(p) = parent {
             if p.same_thread_group(tracer_task) {
                 // pr_info!("Parent: {}, tracer: {}\n", p.pid(), p.pid());
                 // pr_info!("Existing trace relationship!\n");
-                let b = unsafe { ktime_get() };
-                pr_info!("exception found time: {}\n", b-a);
+                // let b = unsafe { ktime_get() };
+                // pr_info!("exception found time: {}\n", b-a);
                 return true;
             }
         }
@@ -450,18 +450,19 @@ struct YamaRust;
 
 impl SecurityModule for YamaRust {
     
-    fn ptrace_access_check(child: TaskStructRef<'_>, mode: c_uint) -> Result {
+    #[inline]
+    fn ptrace_access_check(child: TaskStructRef<'_>, mode: u32, event_ctx: EventContextRef<'_>) -> Result {
         // pr_info!("Ptrace access check!\n");
 
         // static mut times: [i64; 1000] = [0; 1000];
         // static mut times_count: usize = 0;
 
-        let a = unsafe { ktime_get() };
+        // let a = unsafe { ktime_get() };
         // let b = unsafe { ktime_get() };
         // pr_info!("time time: {}\n", b-a);
         
         let mut ret = Ok(());
-        let current = unsafe { TaskStructRef::current() };
+        let current = TaskStructRef::current(event_ctx);
 
         if (mode & PTRACE_MODE_ATTACH) != 0 {
             // pr_info!("Ptrace attach!\n");
@@ -469,25 +470,26 @@ impl SecurityModule for YamaRust {
             match PTRACE_SCOPE.get_val() {
                 YAMA_RUST_SCOPE_DISABLED => {
                     ret = Ok(());
-                }
+                },
                 YAMA_RUST_SCOPE_RELATIONAL => {
                     // let b = unsafe { ktime_get() };
-                    let lock = RCUReadLock::lock();
-                    let ctx = lock.get_ref();
+                    with_rcu_read_lock(|ctx| {
+                        // let lock = RCUReadLock::lock();
+                        // let ctx = lock.get_ref();
 
-                    if !child.pid_alive() {
-                        ret = Err(Error::EPERM)
-                    }
-                    if ret.is_ok() && 
-                        !current.is_descendant(child, ctx) &&
-                        !PTRACER_RELATIONS.exception_found(current, child, ctx) &&
-                        !child.current_ns_capable(CAP_SYS_PTRACE, ctx)
-                    {
-                        // pr_info!("Denied!\n");
-                        ret = Err(Error::EPERM)
-                    }
-                    // });
-                }
+                        if !child.pid_alive() {
+                            ret = Err(Error::EPERM)
+                        }
+                        if ret.is_ok() && 
+                            !current.is_descendant(child, ctx) &&
+                            !PTRACER_RELATIONS.exception_found(current, child, ctx) &&
+                            !child.current_ns_capable(CAP_SYS_PTRACE, ctx)
+                        {
+                            // pr_info!("Denied!\n");
+                            ret = Err(Error::EPERM)
+                        }
+                    });
+                },
                 YAMA_RUST_SCOPE_CAPABILITY => {
                     ret = with_rcu_read_lock(|ctx| {
                         let has_capability = child.current_ns_capable(CAP_SYS_PTRACE, ctx);
@@ -498,11 +500,11 @@ impl SecurityModule for YamaRust {
                             Ok(())
                         }
                     });
-                }
+                },
                 YAMA_RUST_SCOPE_NO_ATTACH => {
                     // pr_info!("Denied!\n");
                     ret = Err(Error::EPERM);
-                }
+                },
                 _ => {
                     // pr_info!("Denied!\n");
                     ret = Err(Error::EPERM);
@@ -511,12 +513,12 @@ impl SecurityModule for YamaRust {
         }
 
         if ret.is_err() && (mode & PTRACE_MODE_NOAUDIT == 0) {
-            report_access(c_str!("attach"), current, child);
+            report_access(c_str!("attach"), current, child, event_ctx);
         }
 
-        let b = unsafe { ktime_get() };
+        // let b = unsafe { ktime_get() };
 
-        pr_info!("ptrace_access_check time: {}\n", b-a);
+        // pr_info!("ptrace_access_check time: {}\n", b-a);
         
         // unsafe {
         //     times[times_count] = b-a;
@@ -532,7 +534,7 @@ impl SecurityModule for YamaRust {
         return ret;
     }
 
-    fn ptrace_traceme(parent: TaskStructRef<'_>) -> Result {
+    fn ptrace_traceme(parent: TaskStructRef<'_>, event_ctx: EventContextRef<'_>) -> Result {
         let mut ret = Ok(());
 
         match PTRACE_SCOPE.get_val() {
@@ -552,14 +554,15 @@ impl SecurityModule for YamaRust {
             }
         }
 
-        let current = unsafe { TaskStructRef::current() };
-
-        report_access(c_str!("traceme"), parent, current);
+        if ret.is_err() {
+            let current = TaskStructRef::current(event_ctx);
+            report_access(c_str!("traceme"), parent, current, event_ctx);
+        }
 
         return ret;
     }
 
-    fn task_free(task: TaskStructRef<'_>) {
+    fn task_free(task: TaskStructRef<'_>, event_ctx: EventContextRef<'_>) {
         // pr_info!("Task free!\n");
         PTRACER_RELATIONS.del_relation(Some(task.get_id()), Some(task.get_id()));
     }
@@ -570,6 +573,7 @@ impl SecurityModule for YamaRust {
         _arg3: c_ulong,
         _arg4: c_ulong,
         _arg5: c_ulong,
+        event_ctx: EventContextRef<'_>,
     ) -> Result {
 
         
@@ -615,7 +619,7 @@ impl SecurityModule for YamaRust {
 
         if option == PR_SET_PTRACER as c_int {
             let myself = with_rcu_read_lock(|ctx| {
-                let current = unsafe { TaskStructRef::current() };
+                let current = TaskStructRef::current(event_ctx);
                 current.get_thread_group_leader(ctx).get_task_struct()
             });
 
@@ -668,33 +672,9 @@ impl SecurityModule for YamaRust {
     fn init(hooks: &'static mut SecurityHookList, init_ctx: InitContextRef<'_>) -> Result {
         pr_info!("Initializing Yama-Rust!\n");
 
-        // SAFETY: exclusive write access from this init function,
-        // and no read accesses as hooks have not been registered
-        // unsafe {
-        //     PTRACE_RELATION_LIST_CLEANUP_WORK.init(init_ctx);
-        // }
-
-        // SAFETY: register() is being called during initialization
-        unsafe { hooks.register(init_ctx) };
-
-        // SAFETY: exclusive write access from this init function,
-        // and no read accesses until the next line (register)
-        // unsafe {
-        //     PTRACE_SCOPE.init(c_str!("ptrace_scope"), 0o0644, init_ctx);
-        // }
+        hooks.register(init_ctx);
 
         PTRACE_SCOPE_SYSCTL_ENTRY.register();
-
-        // match ret {
-        //     Ok(_) => {
-        //         pr_info!("Hooks registered successfully!\n");
-        //         return Ok(());
-        //     }
-        //     Err(e) => {
-        //         pr_info!("Error registering hooks: {}\n", e.to_kernel_errno());
-        //         return Err(e);
-        //     }
-        // }
 
         Ok(())
     }
