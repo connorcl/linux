@@ -159,10 +159,10 @@ pub mod security_module {
             lsm_name: &'static CStr,
             hook_list: &'static mut [security_hook_list],
         ) -> SecurityHookList {
-            return SecurityHookList {
+            SecurityHookList {
                 lsm_name,
                 hook_list,
-            };
+            }
         }
 
         /// Registers the list of security hooks
@@ -173,21 +173,14 @@ pub mod security_module {
         /// * _init_ctx: An `InitContextRef` to confirm execution is in
         /// the intiialization phase.
         ///
-        /// # Safety
-        ///
-        /// This method should not be called concurrently, and there should
-        /// be no concurrent access to the raw list of security hooks
-        /// referred to by the underlying type. If the `define_lsm` macro is used,
-        /// and this method only called within the security module `init` method,
-        /// these conditions should be satisfied.
         #[link_section = ".init.text"]
         pub fn register(&'static mut self, _init_ctx: InitContextRef<'_>) {
             let hooks_ptr = self.hook_list.as_mut_ptr();
             let hooks_len = self.hook_list.len() as c_int;
             let name_ptr = self.lsm_name.as_char_ptr();
-            // SAFETY: internal refs are 'static so are guaranteed to 
-            // remain valid, and self is 'static so referenced data in
-            // struct fields cannot be unsafely accessed later
+            // SAFETY: passed pointers are derived from valid 'static refs
+            // which will continue to be held for 'static lifetime of self
+            // and len value is correctly derived using slice len() method
             unsafe {
                 security_add_hooks(hooks_ptr, hooks_len, name_ptr as *mut c_char);
             }
@@ -225,7 +218,9 @@ pub mod security_module {
             child: *mut task_struct,
             mode: c_uint,
         ) -> c_int {
+            // SAFETY: event_ctx is local and will not outlive security hook call
             let event_ctx = unsafe { EventContext::new() };
+            // SAFETY: pointer passed by kernel should remain valid
             let child = unsafe { TaskStructRef::from_ptr(child, event_ctx.get_ref()).unwrap() };
             match T::ptrace_access_check(child, mode, event_ctx.get_ref()) {
                 Ok(_) => {
@@ -238,7 +233,9 @@ pub mod security_module {
         }
 
         pub unsafe extern "C" fn ptrace_traceme(parent: *mut task_struct) -> c_int {
+            // SAFETY: event_ctx is local and will not outlive security hook call
             let event_ctx = unsafe { EventContext::new() };
+            // SAFETY: pointer passed by kernel should remain valid
             let parent = unsafe { TaskStructRef::from_ptr(parent, event_ctx.get_ref()).unwrap() };
             match T::ptrace_traceme(parent, event_ctx.get_ref()) {
                 Ok(_) => {
@@ -251,7 +248,9 @@ pub mod security_module {
         }
 
         pub unsafe extern "C" fn task_free(task: *mut task_struct) {
+            // SAFETY: event_ctx is local and will not outlive security hook call
             let event_ctx = unsafe { EventContext::new() };
+            // SAFETY: pointer passed by kernel should remain valid
             let task = unsafe { TaskStructRef::from_ptr(task, event_ctx.get_ref()).unwrap() };
             T::task_free(task, event_ctx.get_ref());
         }
@@ -263,6 +262,7 @@ pub mod security_module {
             arg4: c_ulong,
             arg5: c_ulong,
         ) -> c_int {
+            // SAFETY: event_ctx is local and will not outlive security hook call
             let event_ctx = unsafe { EventContext::new() };
             match T::task_prctl(option, arg2, arg3, arg4, arg5, event_ctx.get_ref()) {
                 Ok(_) => {
@@ -330,14 +330,11 @@ pub mod security_module {
             static mut __lsm_hooks_raw: [security_hook_list; __lsm_hook_count] = [
                 $(
                     security_hook_list {
-                        // hook location: bprm_check_security
-                        // SAFETY: pointer to be used in C, *mut required
+                        // SAFETY: security_hook_heads is not accessed, address of field taken
                         head: unsafe { &security_hook_heads.$security_hook as *const _ as *mut _ },
-                        // hook function itself
                         hook: security_list_options {
                             $security_hook: Some(SecurityHooks::<$security_module>::$security_hook),
                         },
-                        // other items initialized with default values (null pointers)
                         list: hlist_node {
                             next: core::ptr::null_mut(),
                             pprev: core::ptr::null_mut(),
@@ -357,7 +354,10 @@ pub mod security_module {
             //  LSM initialization function, stored in init section
             #[link_section = ".init.text"]
             unsafe extern "C" fn __lsm_init_fn() -> c_int {
+                // SAFETY: LSM init function is only called during init
                 let init_ctx = unsafe { InitContext::new() };
+                // SAFETY: __lsm_hooks is only accessed here, and this function
+                // will only be called once, never concurrently
                 let __lsm_hooks_ref = unsafe { &mut __lsm_hooks };
                 let ret = <$security_module>::init(__lsm_hooks_ref, init_ctx.get_ref());
                 match ret {
@@ -402,6 +402,7 @@ pub mod rcu {
     impl RCUReadLock {
         #[inline]
         pub fn lock() -> RCUReadLock {
+            // SAFETY: FFI call
             unsafe {
                 rcu_read_lock_exported();
             }
@@ -422,6 +423,7 @@ pub mod rcu {
     impl Drop for RCUReadLock {
         #[inline]
         fn drop(&mut self) {
+            // SAFETY: FFI call
             unsafe {
                 rcu_read_unlock_exported();
             }
@@ -440,36 +442,50 @@ pub mod rcu {
         f(ctx.get_ref())
     }
 
+    /// # Safety
+    /// 
+    /// `p` must be a valid, safe-to-read pointer to an RCU pointer
     #[inline]
-    pub(crate) unsafe  fn rcu_dereference<T>(p: *mut *mut T, _ctx: RCUReadLockRef<'_>) -> *mut T {
+    pub(crate) unsafe fn rcu_dereference<T>(p: *mut *mut T, _ctx: RCUReadLockRef<'_>) -> *mut T {
+        // SAFETY: p should be valid, safe-to-read pointer to RCU pointer
         unsafe { rcu_dereference_exported(p as *mut *mut c_void) as *mut T }
     }
 
+    /// # Safety
+    /// 
+    /// `p` must be a valid, safe-to-read pointer to an RCU pointer
     #[inline]
     pub(crate) unsafe fn rcu_dereference_const<T>(p: *const *const T, _ctx: RCUReadLockRef<'_>) -> *const T {
+        // SAFETY: p should be valid, safe-to-read pointer to RCU pointer
         unsafe { rcu_dereference_exported(p as *mut *mut c_void) as *const T }
     }
 
+    /// # Safety
+    /// 
+    /// `p` must be a valid, safe-to-write pointer to an RCU pointer
     #[inline]
     pub(crate) unsafe fn rcu_assign_pointer<T>(p: *mut *mut T, v: *mut T, _ctx: RCUReadLockRef<'_>) {
+        // SAFETY: p should be valid, safe-to-write pointer to RCU pointer
         unsafe {
             rcu_assign_pointer_exported(p as *mut *mut c_void, v as *mut c_void);
         }
     }
 
-    // set callback to free allocated memory
+    /// Free an RCU-protected item
+    /// 
+    /// # Safety
+    /// 
+    /// `p` must be a valid RCU heap pointer not being concurrently mutably accessed
     pub(crate) unsafe fn rcu_free<T: GetRCUHead>(p: *mut T, _ctx: RCUReadLockRef<'_>) {
-        if p != core::ptr::null_mut() {
-            // get pointer to RCU head
-            let rcu_head_ptr = unsafe { (*p).get_rcu_head().get() };
-            // get offset of RCU head
-            let rcu_head_offset = (rcu_head_ptr as usize) - (p as usize);
-            // convert offset to function pointer type as required by C interface
-            let callback: rcu_callback_t = unsafe { Some(core::mem::transmute(rcu_head_offset)) };
-            unsafe {
-                // set callback to free memory
-                kvfree_call_rcu(rcu_head_ptr, callback);
-            }
+        // SAFETY: p should be a valid, safe-to-mutably-access RCU pointer
+        let rcu_head_ptr = unsafe { (*p).get_rcu_head().get() };
+        // get offset of RCU head
+        let rcu_head_offset = (rcu_head_ptr as usize) - (p as usize);
+        // SAFETY: kvfree_call_rcu requires offset as type rcu_callback_t
+        let callback: rcu_callback_t = unsafe { Some(core::mem::transmute(rcu_head_offset)) };
+        // SAFETY: callback is offset of *rcu_head_ptr in *p
+        unsafe {
+            kvfree_call_rcu(rcu_head_ptr, callback);
         }
     }
 
@@ -585,6 +601,11 @@ pub mod rcu {
         use core::marker::PhantomData;
         use core::ptr::NonNull;
 
+        /// Link pointers for an RCU list entry
+        /// 
+        /// # Invariants
+        /// 
+        /// `next` and `prev` will always be either null or valid RCU pointers
         pub struct RCUListEntry<T> {
             next: *mut T,
             prev: *mut T,
@@ -607,20 +628,15 @@ pub mod rcu {
 
             // rcu-dereference and return the pointer to the next element
             #[inline]
-            pub fn rcu_dereference_next(&self, ctx: RCUReadLockRef<'_>) -> *mut T {
+            pub(crate) fn rcu_dereference_next(&self, ctx: RCUReadLockRef<'_>) -> *mut T {
                 let ptr_to_list_entry = self.entry.get();
+                // SAFETY: valid pointer, from UnsafeCell get()
                 let ptr_to_next_ptr = unsafe { &mut (*ptr_to_list_entry).next as *mut *mut T };
+                // SAFETY: ptr_to_next_ptr is a valid pointer to an RCU pointer field of self
                 unsafe {
                     rcu_dereference(ptr_to_next_ptr, ctx)
                 }
             }
-
-        //     // atomically assign the given pointer as the pointer to the next element
-        //     pub fn rcu_assign_next(&self, next: *mut T, ctx: RCUReadLockRef<'_>) {
-        //         let ptr_to_list_entry = self.entry.get();
-        //         let ptr_to_next_ptr = unsafe { &mut (*ptr_to_list_entry).next as *mut *mut T };
-        //         rcu_assign_pointer(ptr_to_next_ptr, next, ctx);
-        //     }
         }
 
         pub trait RCUGetLinks {
@@ -629,6 +645,12 @@ pub mod rcu {
             fn get_links(data: &Self::EntryType) -> &RCULinks<Self::EntryType>;
         }
 
+        /// A linked list with RCU-protected elements
+        /// 
+        /// # Invariants
+        /// 
+        /// `head` is either null or a valid RCU pointer, and all list
+        /// elements are owned by the list
         pub struct RCUList<T: RCUGetLinks + GetRCUHead> {
             head: *mut T::EntryType,
         }
@@ -643,6 +665,7 @@ pub mod rcu {
             #[inline]
             pub fn cursor_front_rcu<'a, 'b>(&'a self, ctx: RCUReadLockRef<'b>) -> RCUListCursor<'a, 'b, T> {
                 RCUListCursor {
+                    // SAFETY: self.head is an RCU pointer, & ref to self is held
                     cur: NonNull::new(unsafe { rcu_dereference(
                         &self.head as *const *mut T::EntryType as *mut *mut T::EntryType,
                         ctx,
@@ -658,6 +681,7 @@ pub mod rcu {
                 ctx: RCUReadLockRef<'b>,
             ) -> RCUListCursorMut<'a, 'b, T> {
                 RCUListCursorMut {
+                    // SAFETY: self.head is an RCU pointer, &mut ref to self is held
                     cur: NonNull::new(unsafe { rcu_dereference(
                         &mut self.head as *mut *mut T::EntryType,
                         ctx,
@@ -672,8 +696,8 @@ pub mod rcu {
                 &'a self,
                 ctx: RCUReadLockRef<'b>,
             ) -> RCUListCursorInplaceMut<'a, 'b, T> {
-                // crate::pr_info!("head: {}\n", self.head as usize);
                 RCUListCursorInplaceMut {
+                    // SAFETY: self.head is an RCU pointer, & ref to self is held
                     cur: NonNull::new(unsafe { rcu_dereference(
                         &self.head as *const *mut T::EntryType as *mut *mut T::EntryType,
                         ctx,
@@ -693,11 +717,10 @@ pub mod rcu {
 
                 let old_head = self.head;
 
-                // set new item's link pointers
                 new_list_entry.prev = core::ptr::null_mut();
                 new_list_entry.next = old_head;
 
-                // rcu_assign to the list's head pointer to add the new item
+                // SAFETY: self.head is an RCU pointer, &mut ref to self is held
                 unsafe {
                     rcu_assign_pointer(
                         &mut self.head as *mut *mut T::EntryType,
@@ -715,7 +738,6 @@ pub mod rcu {
                     // SAFETY: pointer is valid as it comes from get() on an UnsafeCell,
                     // and read-only RCU operations will not access prev ptrs
                     unsafe {
-                        // update old head's prev pointer
                         (*old_head_list_entry_ptr).prev = new_ptr;
                     }
                 }
@@ -733,6 +755,11 @@ pub mod rcu {
             }
         }
 
+        /// Cursor allowing immutable RCU access to list and its elements
+        /// 
+        /// # Invariants
+        /// 
+        /// `cur` (optionally) points to an element owned by the relevant list
         pub struct RCUListCursor<'a, 'b, T: RCUGetLinks + GetRCUHead> {
             cur: Option<NonNull<T::EntryType>>,
             _list: PhantomData<&'a RCUList<T::EntryType>>,
@@ -742,14 +769,16 @@ pub mod rcu {
         impl<'a, 'b, T: RCUGetLinks + GetRCUHead> RCUListCursor<'a, 'b, T> {
             #[inline]
             pub fn current(&self) -> Option<&T::EntryType> {
+                // SAFETY: self.cur points to list-owned item and & ref to list is held
                 Some(unsafe { &*self.cur?.as_ptr() })
             }
 
             #[inline]
             pub fn move_next_rcu(&mut self) {
                 if let Some(p) = self.cur {
+                    // SAFETY: self.cur points to list-owned item and & ref to list is held
                     let next_ptr =
-                        unsafe { T::get_links(&mut *p.as_ptr()).rcu_dereference_next(self.rcu_ctx) };
+                        unsafe { T::get_links(&*p.as_ptr()).rcu_dereference_next(self.rcu_ctx) };
                     self.cur = NonNull::new(next_ptr);
                 }
             }
@@ -770,6 +799,7 @@ pub mod rcu {
             #[inline]
             pub fn move_next_rcu(&mut self) {
                 if let Some(p) = self.cur {
+                    // SAFETY: self.cur points to list-owned item and & ref to list is held
                     let next_ptr =
                         unsafe { T::get_links(&mut *p.as_ptr()).rcu_dereference_next(self.rcu_ctx) };
                     self.cur = NonNull::new(next_ptr);
@@ -786,12 +816,14 @@ pub mod rcu {
         impl<'a, 'b, T: RCUGetLinks + GetRCUHead> RCUListCursorMut<'a, 'b, T> {
             #[inline]
             pub fn current(&self) -> Option<&T::EntryType> {
+                // SAFETY: self.cur points to list-owned item and & ref to list is held
                 Some(unsafe { &*self.cur?.as_ptr() })
             }
 
             #[inline]
             pub fn move_next_rcu(&mut self) {
                 if let Some(p) = self.cur {
+                    // SAFETY: self.cur points to list-owned item and & ref to list is held
                     let next_ptr =
                         unsafe { T::get_links(&*p.as_ptr()).rcu_dereference_next(self.rcu_ctx) };
                     self.cur = NonNull::new(next_ptr);
@@ -800,7 +832,7 @@ pub mod rcu {
 
             pub fn remove_current_rcu(&mut self) {
                 if let Some(p) = self.cur {
-                    // SAFETY: using known valid ptrs as read-only refs
+                   // SAFETY: self.cur points to list-owned item and & ref to list is held
                     let cur_list_entry = unsafe {
                         &*T::get_links(&*p.as_ptr()).entry.get()
                     };
@@ -811,13 +843,11 @@ pub mod rcu {
                     // if next ptr is not null
 
                     if next_ptr != core::ptr::null_mut() {
-                        // SAFETY: if next ptr is not null, it must have been set
-                        // to point to valid item
+                        // SAFETY: next ptr is not null, points to owned item
                         let next_list_entry_ptr = unsafe {
                             T::get_links(&*next_ptr).entry.get()
                         };
-                        // SAFETY: mutable ref to list is held, prev pointers
-                        // are not accessed during read-only RCU operations
+                        // SAFETY: accessing owned item
                         unsafe {
                             (*next_list_entry_ptr).prev = prev_ptr;
                         }
@@ -827,7 +857,7 @@ pub mod rcu {
                     let next_ptr_ptr = if prev_ptr == core::ptr::null_mut() {
                         &mut self.list.head as *mut *mut T::EntryType
                     } else {
-                        // prev pointer is not null so must be valid node
+                        // SAFETY: prev pointer is not null, points to owned item
                         let prev_list_entry_ptr = unsafe {
                             T::get_links(&*prev_ptr).entry.get()
                         };
@@ -865,7 +895,7 @@ pub mod rcu {
                     let new_list_entry_ptr = unsafe {
                         T::get_links(&*new_ptr).entry.get()
                     };
-                    // SAFETY: read-only access of known valid pointers
+                    // SAFETY: p is valid pointer to owned item
                     let cur_list_entry_ref = unsafe {
                         &*T::get_links(&*p.as_ptr()).entry.get()
                     };
@@ -885,7 +915,7 @@ pub mod rcu {
                         let prev_list_entry_ptr = unsafe {
                             T::get_links(&*prev_ptr).entry.get()
                         };
-                        // SAFETY: dereferencing known valid ptr from UnsafeCell get()
+                        // SAFETY: accessing field of valid owned item
                         unsafe {
                             &mut (*prev_list_entry_ptr).next as *mut *mut T::EntryType
                         }
@@ -898,12 +928,11 @@ pub mod rcu {
                     }
 
                     if next_ptr != core::ptr::null_mut() {
-                        // SAFETY: next is non-null, so must have been set to valid ptr
+                        // SAFETY: next is non-null and owned
                         let next_list_entry_ptr = unsafe {
                             T::get_links(&*next_ptr).entry.get()
                         };
-                        // SAFETY: valid ptr from UnsafeCell get,
-                        // prev pointer will not be accessed in read-only RCU operations
+                        // SAFETY: accessing field of owned item
                         unsafe {
                             (*next_list_entry_ptr).prev = new_ptr;
                         }
@@ -911,7 +940,7 @@ pub mod rcu {
 
                     // update cursor to point to new item
                     self.cur = NonNull::new(new_ptr);
-                    // queue old item for deallocation
+                    // SAFETY: pointer to dynamically allocated item, no other refs exist
                     unsafe { rcu_free(p.as_ptr(), self.rcu_ctx) };
                 }
             }
@@ -940,6 +969,7 @@ pub mod task {
         #[inline]
         pub(crate) fn from_ptr(ptr: *mut task_struct) -> Option<TaskStruct> {
             let p = NonNull::new(ptr)?;
+            // SAFETY: ptr is not null
             unsafe { 
                 get_task_struct_exported(ptr);
             }
@@ -948,6 +978,7 @@ pub mod task {
 
         #[inline]
         pub(crate) fn from_nonnull(ptr: NonNull<task_struct>) -> TaskStruct {
+            // SAFETY: ptr is not null
             unsafe {
                 get_task_struct_exported(ptr.as_ptr());
             }
@@ -956,12 +987,14 @@ pub mod task {
 
         #[inline]
         pub fn from_pid(pid: pid_t) -> Option<TaskStruct> {
+            // SAFETY: FFI call
             let ptr = unsafe { find_get_task_by_vpid(pid) };
             TaskStruct::from_ptr(ptr)
         }
 
         #[inline]
         pub fn current() -> Option<TaskStruct> {
+            // SAFETY: FFI call
             let ptr = unsafe { get_current_exported() };
             TaskStruct::from_ptr(ptr)
         }
@@ -983,6 +1016,7 @@ pub mod task {
     impl Drop for TaskStruct {
         #[inline]
         fn drop(&mut self) {
+            // SAFETY: ptr is not null
             unsafe {
                 put_task_struct_exported(self.ptr.as_ptr());
             }
@@ -1040,6 +1074,7 @@ pub mod task {
 
         #[inline]
         pub fn current(ctx: EventContextRef<'a>) -> TaskStructRef<'a> {
+            // SAFETY: current should never be null in EventContext
             let p = unsafe {
                 NonNull::new_unchecked(get_current_exported())
             };
@@ -1061,39 +1096,49 @@ pub mod task {
 
         #[inline]
         pub const fn pid(self) -> pid_t {
+            // SAFETY: reading field of non-null task_struct
             unsafe { (*self.ptr.as_ptr()).pid }
         }
 
         #[inline]
         pub fn same_thread_group(self, other: TaskStructRef<'_>) -> bool {
+            // SAFETY: reading field of non-null task_struct
             unsafe { (*self.ptr.as_ptr()).signal == (*other.ptr.as_ptr()).signal }
         }
 
         #[inline]
         pub fn thread_group_leader(self) -> bool {
+            // SAFETY: reading field of non-null task_struct
             unsafe { (*self.ptr.as_ptr()).exit_signal >= 0 }
         }
 
         #[inline]
         pub fn pid_alive(self) -> bool {
+            // SAFETY: reading field of non-null task_struct
             unsafe { (*self.ptr.as_ptr()).thread_pid != core::ptr::null_mut() }
         }
 
         #[inline]
         pub fn flags_set(self, flags: u32) -> bool {
+            // SAFETY: reading field of non-null task_struct
             unsafe { (*self.ptr.as_ptr()).flags & flags != 0 }
         }
 
         #[inline]
         pub fn current_ns_capable(self, cap: u32, ctx: RCUReadLockRef<'_>) -> bool {
+            // SAFETY: self.ptr is non null
             let task_cred = unsafe {
                 rcu_dereference_const(&(*self.ptr.as_ptr()).real_cred as *const *const cred, ctx)
             };
-            unsafe { ns_capable_exported((*task_cred).user_ns, cap.try_into().unwrap()) >= 0 }
+            // SAFETY: real_cred should be valid
+            let user_ns = unsafe { (*task_cred).user_ns };
+            // SAFETY: FFI call
+            unsafe { ns_capable_exported(user_ns, cap.try_into().unwrap()) >= 0 }
         }
 
         #[inline]
         pub fn has_ns_capability_current(self, cap: u32) -> bool {
+            // SAFETY: self.ptr is non null
             unsafe {
                 has_ns_capability(
                     self.ptr.as_ptr(),
@@ -1104,13 +1149,16 @@ pub mod task {
         }
 
         pub fn get_cmdline_str(self) -> Option<Box<CStr>> {
+            // SAFETY: self.ptr is non null
             let cmdline_str_ptr = unsafe {
                 kstrdup_quotable_cmdline(self.ptr.as_ptr(), GFP_KERNEL)
             };
             if cmdline_str_ptr != core::ptr::null_mut() {
+                // SAFETY: cmdline_str_ptr is not null and was provided by the kernel
                 let cmdline_str = unsafe {
                     CStr::from_char_ptr(cmdline_str_ptr)
                 };
+                // SAFETY: cmdline_str points to dynamically allocated string
                 unsafe {
                     Some(Box::from_raw(cmdline_str as *const _ as *mut _))
                 }
@@ -1124,12 +1172,14 @@ pub mod task {
             self,
             ctx: RCUReadLockRef<'a>,
         ) -> TaskStructRef<'a> {
+            // SAFETY: self.ptr is not null, real_parent is an RCU pointer
             let ptr = unsafe {
                 rcu_dereference(&mut (*self.ptr.as_ptr()).real_parent as *mut *mut _, ctx)
             };
             if ptr == core::ptr::null_mut() {
                 self
             } else {
+                // SAFETY: ptr is not null
                 let ptr = unsafe { NonNull::new_unchecked(ptr) };
                 TaskStructRef { ptr,  _marker: PhantomData }
             }
@@ -1143,9 +1193,11 @@ pub mod task {
             if self.thread_group_leader() {
                 self
             } else {
+                // SAFETY: self.ptr is not null, group_leader is RCU pointer
                 let ptr = unsafe {
                     rcu_dereference(&mut (*self.ptr.as_ptr()).group_leader as *mut *mut _, ctx)
                 };
+                // SAFETY: group leader should not be null if not thread group leader
                 let ptr = unsafe { NonNull::new_unchecked(ptr) };
                 TaskStructRef { ptr,  _marker: PhantomData }
             }
@@ -1156,6 +1208,7 @@ pub mod task {
             self,
             ctx: RCUReadLockRef<'a>,
         ) -> Option<TaskStructRef<'a>> {
+            // SAFETY: self.ptr is not null, parent is RCU pointer
             let ptr =
                 unsafe { rcu_dereference(&mut (*self.ptr.as_ptr()).parent as *mut *mut _, ctx) };
             let ptr = NonNull::new(ptr)?; 
@@ -1187,6 +1240,7 @@ pub mod task {
 
     #[inline]
     pub fn current_capable(cap: i32) -> bool {
+        // SAFETY: FFI call
         unsafe { capable_exported(cap) }
     }
 }
@@ -1216,8 +1270,7 @@ pub mod work_queue {
 
     impl<T: StaticWorkFunc> StaticWorkStruct<T> {
         pub const fn init(this: &'static StaticWorkStruct<T>) -> StaticWorkStruct<T> {
-            // SAFETY: pointer is valid and no race condition is possible
-            // as this const function is evaluated at compile time
+            // SAFETY: pointer from UnsafeCell get() is valid
             let this_entry_ptr = unsafe {
                 &((*this.work.get()).entry) as *const _ as *mut _
             };
@@ -1239,6 +1292,7 @@ pub mod work_queue {
         }
 
         pub fn schedule(&'static self) {
+            // SAFETY: self.work.get() pointer is valid for 'static
             unsafe {
                 schedule_work_exported(self.work.get() as *const _ as *mut _);
             }
@@ -1253,7 +1307,7 @@ pub mod work_queue {
         };
     }
 
-    // this type's methods do not read or write any of its data
+    // SAFETY: this type's methods do not read or write any of its data
     unsafe impl<T: StaticWorkFunc> Sync for StaticWorkStruct<T> {}
 
     pub trait DynamicWorkFunc {
@@ -1263,7 +1317,7 @@ pub mod work_queue {
     }
 
     unsafe extern "C" fn dynamic_work_func<T: DynamicWorkFunc>(work: *mut callback_head) {
-        // SAFETY: callback_head pts to field of Box-allocated work payload
+        // SAFETY: callback_head points to field of Box-allocated work payload
         let payload = unsafe {
             Box::from_raw(container_of!(work, DynamicWorkStruct<T>, work_head)
                 as *mut DynamicWorkStruct<T>)
@@ -1298,8 +1352,10 @@ pub mod work_queue {
             // covert to raw pointer to prevent drop
             let payload = Box::into_raw(payload);
 
+            // SAFETY: FFI call
             let current = unsafe { get_current_exported() };
 
+            // SAFETY: payload is valid pointer from Box
             let ret = unsafe {
                 task_work_add(
                     current,
@@ -1352,19 +1408,27 @@ pub mod sysctl {
         }
     }
     
+    /// Newtype wrapper around a ctl_table
+    /// 
+    /// # Invariants
+    /// 
+    /// `data`, `extra1` and `extra2` pointees are valid and safe to read
     #[repr(transparent)]
     pub struct SysctlTable(ctl_table);
 
     impl SysctlTable {
-        pub const fn get_data(&self) -> i32 { 
+        pub const fn get_data(&self) -> i32 {
+            // SAFETY: data field is safe to read
             unsafe { *(self.0.data as *const i32) }
         }
 
         pub const fn get_min(&self) -> i32 { 
+            // SAFETY: extra1 field is safe to read
             unsafe { *(self.0.extra1 as *const i32) } 
         }
 
-        pub const fn get_max(&self) -> i32 { 
+        pub const fn get_max(&self) -> i32 {
+            // SAFETY: extra2 field is safe to read
             unsafe { *(self.0.extra1 as *const i32) }
         }
 
@@ -1384,6 +1448,7 @@ pub mod sysctl {
         lenp: *mut c_size_t,
         ppos: *mut loff_t,
     ) -> c_int {
+        // SAFETY: table is provided by the kernel
         let mut table_copy = unsafe { SysctlTable(*table) };
 
         if write != 0 {
@@ -1392,6 +1457,7 @@ pub mod sysctl {
             }
         }
 
+        // SAFETY: table_copy is valid, args passed through from kernel
         unsafe {
             proc_dointvec_minmax(&mut table_copy as *mut _ as *mut _, write, buffer, lenp, ppos)
         }
@@ -1403,17 +1469,21 @@ pub mod sysctl {
         max: c_int,
     }
 
-    unsafe impl Sync for BoundedInt {}
-
     impl BoundedInt {
         pub const fn new(val: i32, min: i32, max: i32) -> BoundedInt {
             BoundedInt { val: UnsafeCell::new(val), min, max }
         }
-
+        
         #[inline]
-        pub const fn get_val(&self) -> i32 { unsafe { *self.val.get() } }
+        pub const fn get_val(&self) -> i32 { 
+            // SAFETY: field of self is being read
+            unsafe { *self.val.get() } 
+        }
     }
-
+    
+    // SAFETY: public interface only allows reading data
+    unsafe impl Sync for BoundedInt {}
+    
     pub struct SysctlInt<T: SysctlIntWriteHook> {
         data: &'static BoundedInt,
         sysctl_path: &'static [SysctlPath],
@@ -1460,7 +1530,7 @@ pub mod sysctl {
         }
 
         pub fn register(&'static self) {
-            let sret = unsafe {
+            unsafe {
                 register_sysctl_paths(
                     self.sysctl_path.as_ptr() as *const _,
                     self.sysctl_table.get() as *mut _,
@@ -1469,6 +1539,6 @@ pub mod sysctl {
         }
     }
 
-    // stored pointers are never dereferenced/leaked in type's interface
+    // SAFETY: stored pointers are never dereferenced/leaked in type's interface
     unsafe impl<T: SysctlIntWriteHook> Sync for SysctlInt<T> {}
 }
