@@ -18,6 +18,14 @@ use kernel::yama_rust_interfaces::work_queue::*;
 use kernel::Error;
 use kernel::{define_lsm, init_static_sync, init_static_work_struct};
 
+// Yama permissiveness values
+const YAMA_RUST_SCOPE_DISABLED: i32 = 0;
+const YAMA_RUST_SCOPE_RELATIONAL: i32 = 1;
+const YAMA_RUST_SCOPE_CAPABILITY: i32 = 2;
+const YAMA_RUST_SCOPE_NO_ATTACH: i32 = 3;
+
+// define the LSM 'yama_rust', specifying its hook functions and
+// the type which implements these
 define_lsm!(
     "yama_rust",
     YamaRust,
@@ -27,38 +35,45 @@ define_lsm!(
     task_prctl
 );
 
+// the list of registered tracer-tracee relations
+static PTRACER_RELATIONS: PtraceRelationList = PtraceRelationList::new();
+
+// spinlock used to synchronize write accesses to the list of
+// registered tracing relations, PTRACER_RELATIONS
 init_static_sync! {
     static PTRACE_RELATION_LIST_WRITE_LOCK: SpinLock<()> = ();
 }
 
+// static work queue task for cleaning up invalid relations
 init_static_work_struct! {
     static PTRACE_RELATION_LIST_CLEANUP_WORK: StaticWorkStruct<PtraceRelationListCleanup>;
 }
 
+// permissiveness value exported via sysctl
 static PTRACE_SCOPE: BoundedInt = BoundedInt::new(
     YAMA_RUST_SCOPE_RELATIONAL,
     YAMA_RUST_SCOPE_DISABLED,
     YAMA_RUST_SCOPE_NO_ATTACH,
 );
 
-static PTRACE_SCOPE_SYSCTL_ENTRY: SysctlInt<PtraceScopeWriteHook> = SysctlInt::init(
-        &PTRACE_SCOPE,
-        c_str!("ptrace_scope"),
-        0o0644,
-        gen_sysctl_path!("kernel", "yama"),
+// sysctl entry for the above permissiveness value
+static PTRACE_SCOPE_SYSCTL_ENTRY: SysctlInt<PtraceScopeWriteHook> = SysctlInt::new(
+    &PTRACE_SCOPE,
+    c_str!("ptrace_scope"),
+    0o0644,
+    gen_sysctl_path!("kernel", "yama"),
 );
-
-static PTRACER_RELATIONS: PtraceRelationList = PtraceRelationList::new();
 
 struct PtraceRelationListCleanup;
 
+// work queue task function for cleaning up invalid relations
 impl StaticWorkFunc for PtraceRelationListCleanup {
     fn work_func() {
-        //pr_info!("Relation cleanup from work queue!\n");
         PTRACER_RELATIONS.cleanup_relations();
     }
 }
 
+// info needed for reporting an attempted ptrace operation
 struct AccessReportInfo {
     access: &'static CStr,
     target: TaskStruct,
@@ -67,10 +82,13 @@ struct AccessReportInfo {
 
 struct ReportAccess;
 
+// dynamic work function for reporting attempted accesses
 impl DynamicWorkFunc for ReportAccess {
+    // each task includes info on the attempted access
     type AssociatedDataType = AccessReportInfo;
 
     fn work_func(data: &AccessReportInfo) {
+        // get command line strings for each process
         let target_cmdline = data.target.get_ref().get_cmdline_str();
         let agent_cmdline = data.agent.get_ref().get_cmdline_str();
         let target_cmdline = if let Some(ref t) = target_cmdline {
@@ -83,8 +101,9 @@ impl DynamicWorkFunc for ReportAccess {
         } else {
             c_str!("")
         };
+        // print notice that access was attempted
         pr_notice!(
-            "ptrace {} of \"{}\"[{}] was attempted by \"{}\"[{}]\n", 
+            "ptrace {} of \"{}\"[{}] was attempted by \"{}\"[{}]\n",
             data.access,
             target_cmdline,
             data.target.get_ref().pid(),
@@ -94,95 +113,54 @@ impl DynamicWorkFunc for ReportAccess {
     }
 }
 
-type ReportAccessTask = DynamicWorkStruct<ReportAccess>;
-
-fn report_access(access: &'static CStr, target: TaskStructRef<'_>, agent: TaskStructRef<'_>, event_ctx: EventContextRef<'_>) {
+// report an attempted ptrace access
+fn report_access(
+    access: &'static CStr,
+    target: TaskStructRef<'_>,
+    agent: TaskStructRef<'_>,
+    event_ctx: EventContextRef<'_>,
+) {
+    // package relevant info
     let info = AccessReportInfo {
         access: access,
         target: target.get_task_struct(),
         agent: agent.get_task_struct(),
     };
-
     let current = TaskStructRef::current(event_ctx);
     if current.flags_set(PF_KTHREAD) {
+        // report access directly if running in a kernel thread
         ReportAccess::work_func(&info);
     } else {
-        ReportAccessTask::create_and_schedule(info);
+        // schedule a work queue task to report attempted access
+        DynamicWorkStruct::<ReportAccess>::create_and_schedule(info);
     }
 }
 
-// #[derive(Copy, Clone)]
-// enum PtraceScope {
-//     Disabled = 0,
-//     Relational = 1,
-//     Capability = 2,
-//     NoAttach = 3,
-// }
-
-const YAMA_RUST_SCOPE_DISABLED: i32 = 0;
-const YAMA_RUST_SCOPE_RELATIONAL: i32 = 1;
-const YAMA_RUST_SCOPE_CAPABILITY: i32 = 2;
-const YAMA_RUST_SCOPE_NO_ATTACH: i32 = 3;
-
-// impl PtraceScope {
-//     pub(crate) const fn max() -> i32 {
-//         PtraceScope::NoAttach as i32
-//     }
-
-//     pub(crate) const fn min() -> i32 {
-//         PtraceScope::Disabled as i32
-//     }
-
-//     pub(crate) const fn default() -> i32 {
-//         PtraceScope::Relational as i32
-//     }
-
-//     pub(crate) fn from_int(x: i32) -> PtraceScope {
-//         match x {
-            
-//         }
-//         if x <= >
-//         if x == PtraceScope::Disabled as i32 {
-//             Some(PtraceScope::Disabled)
-//         } else if x == PtraceScope::Relational as i32 {
-//             Some(PtraceScope::Relational)
-//         } else if x == PtraceScope::Capability as i32 {
-//             Some(PtraceScope::Capability)
-//         } else if x == PtraceScope::NoAttach as i32 {
-//             Some(PtraceScope::NoAttach)
-//         } else {
-//             None
-//         }
-//     }
-
-//     pub(crate) const fn to_int(&self) -> i32 {
-//         *self as i32
-//     }
-// }
-
 struct PtraceScopeWriteHook;
 
+// sysctl write hook for configuring permissiveness
 impl SysctlIntWriteHook for PtraceScopeWriteHook {
     fn write_hook(table: &mut SysctlTable) -> Result {
+        // ensure current task has CAP_SYS_PTRACE capability
         if !current_capable(CAP_SYS_PTRACE.try_into().unwrap()) {
-            pr_info!("Setting ptrace scope not permitted!\n");
             return Err(Error::EPERM);
         }
-
+        // lock permissiveness to most restrictive (max value) once set
         if table.get_data() == table.get_max() {
-            pr_info!("Locking scope to highest value!\n");
             table.lock_max();
         }
-
         Ok(())
     }
 }
 
+// a permitted tracer-tracee relationship
 #[derive(Copy, Clone)]
 enum PtraceRelation {
+    // any tracer permitted
     AnyTracer {
         tracee: TaskStructID,
     },
+    // specific tracer permitted
     TracerTracee {
         tracer: TaskStructID,
         tracee: TaskStructID,
@@ -190,6 +168,8 @@ enum PtraceRelation {
 }
 
 impl PtraceRelation {
+    // convenience method to get tracee
+    #[inline]
     fn get_tracee(&self) -> TaskStructID {
         match self {
             PtraceRelation::AnyTracer { tracee } => *tracee,
@@ -198,6 +178,7 @@ impl PtraceRelation {
     }
 }
 
+// type for storing a tracing relation in a linked list
 struct PtraceRelationNode {
     relation: PtraceRelation,
     rcu_head: RCUHead,
@@ -206,6 +187,7 @@ struct PtraceRelationNode {
 }
 
 impl PtraceRelationNode {
+    // create a new node
     pub(crate) fn new(relation: PtraceRelation, invalid: bool) -> PtraceRelationNode {
         return PtraceRelationNode {
             relation,
@@ -215,28 +197,35 @@ impl PtraceRelationNode {
         };
     }
 
-    fn matches_tracee(&self, tracer_task: TaskStructRef<'_>, tracee_task: TaskStructRef<'_>, ctx: RCUReadLockRef<'_>) -> bool {
+    // check if the relation matches the given tasks
+    fn matches_tracee(
+        &self,
+        tracer_task: TaskStructRef<'_>,
+        tracee_task: TaskStructRef<'_>,
+        ctx: RCUReadLockRef<'_>,
+    ) -> bool {
         if !self.invalid {
             match self.relation {
+                // check if the tracee matches
                 PtraceRelation::AnyTracer { tracee } => {
                     if tracee_task.get_id() == tracee {
-                        return true
+                        return true;
                     }
-                },
+                }
+                // check if tracee matches and tracer is descendant of permitted tracer
                 PtraceRelation::TracerTracee { tracer, tracee } => {
                     if tracee_task.get_id() == tracee {
-                        let tmp_tracer_ref = unsafe {
-                            tracer.get_tmp_ref()
-                        };
+                        let tmp_tracer_ref = unsafe { tracer.get_tmp_ref() };
                         return tmp_tracer_ref.is_descendant(tracer_task, ctx);
                     }
                 }
             }
         }
-        return false
+        return false;
     }
 }
 
+// fetch rcu head field
 impl GetRCUHead for PtraceRelationNode {
     #[inline]
     fn get_rcu_head(&self) -> &RCUHead {
@@ -244,6 +233,7 @@ impl GetRCUHead for PtraceRelationNode {
     }
 }
 
+// fetch rcu links field
 impl RCUGetLinks for PtraceRelationNode {
     type EntryType = PtraceRelationNode;
 
@@ -253,18 +243,23 @@ impl RCUGetLinks for PtraceRelationNode {
     }
 }
 
+// RCU-protected list of ptrace relations
 struct PtraceRelationList {
     list: UnsafeCell<RCUList<PtraceRelationNode>>,
 }
 
-unsafe impl Sync for PtraceRelationList { }
+// synchronized via RCU and spinlock
+unsafe impl Sync for PtraceRelationList {}
 
 impl PtraceRelationList {
-
+    // initialize an empty list
     pub(crate) const fn new() -> PtraceRelationList {
-        PtraceRelationList { list: UnsafeCell::new(RCUList::new()) }
+        PtraceRelationList {
+            list: UnsafeCell::new(RCUList::new()),
+        }
     }
 
+    // delete invalid relations
     pub(crate) fn cleanup_relations(&self) {
         // lock spinlock to synchronize mutable access to list
         let _lock = PTRACE_RELATION_LIST_WRITE_LOCK.lock();
@@ -278,7 +273,6 @@ impl PtraceRelationList {
             while let Some(relation) = cursor.current() {
                 // check if the relation is invalid and remove if so
                 if relation.invalid {
-                    // pr_info!("Removing invalid relationship!\n");
                     cursor.remove_current_rcu();
                 } else {
                     cursor.move_next_rcu();
@@ -287,66 +281,37 @@ impl PtraceRelationList {
         });
     }
 
+    // add a new relation
     pub(crate) fn add_relation(&self, relation: PtraceRelation) {
-        
-        // let a = unsafe { ktime_get() };
-
-        // allocate memory for new item
-        let new_item = Box::try_new(PtraceRelationNode::new(relation, false));
-
-        if let Ok(n) = new_item {
+        if let Ok(n) = Box::try_new(PtraceRelationNode::new(relation, false)) {
             // lock spinlock to synchronize mutable access to list
             let _lock = PTRACE_RELATION_LIST_WRITE_LOCK.lock();
-            
             // get reference to list: safe as lock is held
             let list = unsafe { &mut *self.list.get() };
-
-            // let b = unsafe { ktime_get() };
-            
-            // let c = unsafe { ktime_get() };
-            
             // enter RCU critical section
             with_rcu_read_lock(|ctx| {
-
                 let relation_tracee = n.relation.get_tracee();
-                
                 // get a cursor pointing to the first element of the list
                 let mut cursor = list.cursor_front_mut_rcu(ctx);
                 // unwrap each element of the list in turn, moving the cursor along
-                
-                let mut count = 0;
-
                 while let Some(relation_node) = cursor.current() {
-                    count += 1;
                     if !relation_node.invalid {
-                        // pr_info!("Valid!\n");
                         // update tracer if an existing relationship is present
                         let t = relation_node.relation.get_tracee();
-                        // pr_info!("t: {}, new relation_tracee: {}\n", t.get_ptr() as usize, relation_tracee.get_ptr() as usize);
                         if t == relation_tracee {
-                            // pr_info!("Replacing relationship! count: {}\n", count);
                             cursor.replace_current_rcu(n);
                             return;
                         }
                     }
-                    
                     cursor.move_next_rcu();
                 }
-
-                // pr_info!("Adding new relationship! count: {}\n", count);
-                // if an existing relationship wasn't found, add a new one
-                
-                // let d = unsafe { ktime_get() };
-                
+                // push item onto list
                 list.push_front_rcu(n, ctx);
-
-                // let e = unsafe { ktime_get() };
-                // pr_info!("Add time: {}\n", e-a);
-                // pr_info!("Times: {}, {}, {}, {}. Total: {}, Count: {}\n", b - a, c - b, d - c, e - d, e - a, count);
             });
         }
     }
 
+    // delete a relation by marking it as invalid
     pub(crate) fn del_relation(
         &self,
         tracer_task: Option<TaskStructID>,
@@ -363,19 +328,16 @@ impl PtraceRelationList {
             // worst case invalid is set for an old item
             // which is then removed
             let mut cursor = list.cursor_front_inplace_mut_rcu(ctx);
-            // let mut count = 0;
             // unwrap each element of the list in turn, moving the cursor along
             while let Some(relation_node_ptr) = cursor.current_mut() {
                 // SAFETY: read access to current item is always safe
                 let relation_node = unsafe { &*relation_node_ptr };
-                // count = count + 1;
                 if !relation_node.invalid {
                     if let Some(t) = &tracer_task {
                         if let PtraceRelation::TracerTracee { tracer, tracee: _ } =
                             &relation_node.relation
                         {
                             if *t == *tracer {
-                                // pr_info!("Found match, marking relationship as invalid!\n");
                                 // SAFETY: updating invalid is safe, see above
                                 unsafe {
                                     (*relation_node_ptr).invalid = true;
@@ -384,11 +346,9 @@ impl PtraceRelationList {
                             }
                         }
                     }
-                    // obs - help consider borrowing here - move during loop
                     if let Some(t) = &tracee_task {
                         // SAFETY: reading current item is always safe
                         if *t == relation_node.relation.get_tracee() {
-                            // pr_info!("Found match, marking relationship as invalid!\n");
                             // SAFETY: updating invalid is safe, see above
                             unsafe {
                                 (*relation_node_ptr).invalid = true;
@@ -399,39 +359,30 @@ impl PtraceRelationList {
                 }
                 cursor.move_next_rcu();
             }
-            // pr_info!("Relationships: {}\n", count);
-
+            // launch task to perform deletion if any marked as invalid
             if marked {
-                // pr_info!("Marked!\n");
                 PTRACE_RELATION_LIST_CLEANUP_WORK.schedule();
             }
         });
     }
 
+    // check for a matching exception
     pub(crate) fn exception_found(
         &self,
         tracer_task: TaskStructRef<'_>,
         tracee_task: TaskStructRef<'_>,
         ctx: RCUReadLockRef<'_>,
     ) -> bool {
-        // let a = unsafe { ktime_get() };
         let mut tracee_task = tracee_task;
         let parent = tracee_task.get_ptrace_parent(ctx);
         if let Some(p) = parent {
             if p.same_thread_group(tracer_task) {
-                // pr_info!("Parent: {}, tracer: {}\n", p.pid(), p.pid());
-                // pr_info!("Existing trace relationship!\n");
-                // let b = unsafe { ktime_get() };
-                // pr_info!("exception found time: {}\n", b-a);
                 return true;
             }
         }
-
         tracee_task = tracee_task.get_thread_group_leader(ctx);
-
-        // get reference to list: safe as accesses will be read only RCU
+        // SAFETY: accesses will be read only RCU
         let list = unsafe { &*self.list.get() };
-
         // get a cursor pointing to the first element of the list
         let mut cursor = list.cursor_front_rcu(ctx);
         // unwrap each element of the list in turn, moving the cursor along
@@ -441,7 +392,6 @@ impl PtraceRelationList {
             }
             cursor.move_next_rcu();
         }
-
         return false;
     }
 }
@@ -449,124 +399,127 @@ impl PtraceRelationList {
 struct YamaRust;
 
 impl SecurityModule for YamaRust {
-    
+    // Yama's ptrace access check hook
     #[inline]
-    fn ptrace_access_check(child: TaskStructRef<'_>, mode: u32, event_ctx: EventContextRef<'_>) -> Result {
-        // pr_info!("Ptrace access check!\n");
+    fn ptrace_access_check(
+        child: TaskStructRef<'_>,
+        mode: u32,
+        event_ctx: EventContextRef<'_>,
+    ) -> Result {
+        // unsafe { rcu_read_lock_exported() };
 
-        // static mut times: [i64; 1000] = [0; 1000];
-        // static mut times_count: usize = 0;
+        // let mut x = 1234;
+        // let mut y = 5678;
+        // let mut p = &mut x as *mut _;
+        // let mut rcu_p;
 
         // let a = unsafe { ktime_get() };
+
+        // for i in 0..1000 {
+        //     unsafe {
+        //         // rcu_read_lock_exported();
+        //         rcu_p = rcu_dereference_exported(&mut p as *mut *mut _ as *mut *mut c_void);
+        //         rcu_assign_pointer_exported(&mut p as *mut *mut _ as *mut *mut c_void, &mut x as *mut _ as *mut _);
+        //         // rcu_assign_pointer_exported(&mut p as *mut *mut _ as *mut *mut c_void, &mut y as *mut _ as *mut _);
+        //         // rcu_read_unlock_exported();
+        //     }
+        // }
+
         // let b = unsafe { ktime_get() };
-        // pr_info!("time time: {}\n", b-a);
-        
+
+        // pr_info!("RCU lock/unlock time: {}\n", b-a);
+        // pr_info!("RCU dereference/assign time: {}\n", b-a);
+
+        // unsafe { rcu_read_unlock_exported() };
+
         let mut ret = Ok(());
         let current = TaskStructRef::current(event_ctx);
-
+        // process ptrace attach operations
         if (mode & PTRACE_MODE_ATTACH) != 0 {
-            // pr_info!("Ptrace attach!\n");
-
+            // check current mode
             match PTRACE_SCOPE.get_val() {
+                // permit all accesses
                 YAMA_RUST_SCOPE_DISABLED => {
                     ret = Ok(());
-                },
+                }
+                // permit processes to trace their descendants
                 YAMA_RUST_SCOPE_RELATIONAL => {
-                    // let b = unsafe { ktime_get() };
                     with_rcu_read_lock(|ctx| {
-                        // let lock = RCUReadLock::lock();
-                        // let ctx = lock.get_ref();
-
+                        // check if child is alive
                         if !child.pid_alive() {
                             ret = Err(Error::EPERM)
                         }
-                        if ret.is_ok() && 
-                            !current.is_descendant(child, ctx) &&
-                            !PTRACER_RELATIONS.exception_found(current, child, ctx) &&
-                            !child.current_ns_capable(CAP_SYS_PTRACE, ctx)
+                        // check if task is a child of current, an exception is
+                        // registered, or CAP_SYS_PTRACE cap is held
+                        if ret.is_ok()
+                            && !current.is_descendant(child, ctx)
+                            && !PTRACER_RELATIONS.exception_found(current, child, ctx)
+                            && !child.current_ns_capable(CAP_SYS_PTRACE, ctx)
                         {
-                            // pr_info!("Denied!\n");
                             ret = Err(Error::EPERM)
                         }
                     });
-                },
+                }
+                // only allow if CAP_SYS_PTRACE cap is held
                 YAMA_RUST_SCOPE_CAPABILITY => {
                     ret = with_rcu_read_lock(|ctx| {
                         let has_capability = child.current_ns_capable(CAP_SYS_PTRACE, ctx);
                         if !has_capability {
-                            // pr_info!("Denied!\n");
                             Err(Error::EPERM)
                         } else {
                             Ok(())
                         }
                     });
-                },
+                }
+                // deny all accesses
                 YAMA_RUST_SCOPE_NO_ATTACH => {
-                    // pr_info!("Denied!\n");
                     ret = Err(Error::EPERM);
-                },
+                }
                 _ => {
-                    // pr_info!("Denied!\n");
                     ret = Err(Error::EPERM);
                 }
             }
         }
-
+        // report denied accesses
         if ret.is_err() && (mode & PTRACE_MODE_NOAUDIT == 0) {
             report_access(c_str!("attach"), current, child, event_ctx);
         }
-
-        // let b = unsafe { ktime_get() };
-
-        // pr_info!("ptrace_access_check time: {}\n", b-a);
-        
-        // unsafe {
-        //     times[times_count] = b-a;
-        //     times_count += 1;
-        //     if times_count == 1000 {
-        //         for i in 0..1000 {
-        //             pr_info!("ptrace_access_check time: {}\n", times[i]);
-        //         }
-        //         times_count = 0;
-        //     }
-        // }
-
         return ret;
     }
 
+    // Yama ptrace traceme hook
     fn ptrace_traceme(parent: TaskStructRef<'_>, event_ctx: EventContextRef<'_>) -> Result {
         let mut ret = Ok(());
-
+        // check current mode
         match PTRACE_SCOPE.get_val() {
+            // only allow if CAP_SYS_PTRACE capability is held
             YAMA_RUST_SCOPE_CAPABILITY => {
                 let has_capability = parent.has_ns_capability_current(CAP_SYS_PTRACE);
                 if !has_capability {
                     ret = Err(Error::EPERM);
-                    pr_info!("Traceme denied!\n");
                 }
-            },
-            YAMA_RUST_SCOPE_NO_ATTACH => {
-                pr_info!("Traceme denied!\n");
-                ret = Err(Error::EPERM);
-            },
-            _ => {
-                // pr_info!("Traceme permitted!\n");
             }
+            // deny all accesses
+            YAMA_RUST_SCOPE_NO_ATTACH => {
+                ret = Err(Error::EPERM);
+            }
+            // allow all accesses in other modes
+            _ => {}
         }
-
+        // report denied accesses
         if ret.is_err() {
             let current = TaskStructRef::current(event_ctx);
             report_access(c_str!("traceme"), parent, current, event_ctx);
         }
-
         return ret;
     }
 
-    fn task_free(task: TaskStructRef<'_>, event_ctx: EventContextRef<'_>) {
-        // pr_info!("Task free!\n");
+    // Yama task free hook
+    fn task_free(task: TaskStructRef<'_>, _event_ctx: EventContextRef<'_>) {
         PTRACER_RELATIONS.del_relation(Some(task.get_id()), Some(task.get_id()));
     }
 
+    // Yama task prctl hook
     fn task_prctl(
         option: c_int,
         arg2: c_ulong,
@@ -575,65 +528,26 @@ impl SecurityModule for YamaRust {
         _arg5: c_ulong,
         event_ctx: EventContextRef<'_>,
     ) -> Result {
-
-        
-        // static mut times: [i64; 1000] = [0; 1000];
-        // static mut times_count: usize = 0;
-        unsafe { rcu_read_lock_exported() };
-        
-        let a = unsafe { ktime_get() };
-
-        let mut x = 1234;
-        let mut y = 5678;
-        let mut p = &mut x as *mut _;
-
-
-        for i in 0..1000 {
-            unsafe {
-                // rcu_read_lock_exported();
-                // rcu_dereference_exported(&mut p as *mut *mut _ as *mut *mut c_void);
-                rcu_assign_pointer_exported(&mut p as *mut *mut _ as *mut *mut c_void, &mut x as *mut _ as *mut _);
-                // rcu_assign_pointer_exported(&mut p as *mut *mut _ as *mut *mut c_void, &mut y as *mut _ as *mut _);
-                // rcu_read_unlock_exported();
-            }
-        }
-
-        let b = unsafe { ktime_get() };
-
-        pr_info!("time: {}\n", b-a);
-
-        unsafe { rcu_read_unlock_exported() };
-
-        // for i in 0..1000 {
-        //     unsafe {
-        //         // rcu_read_lock_exported();
-        //         // rcu_dereference_exported(&mut p as *mut *mut _ as *mut *mut c_void);
-        //         // rcu_assign_pointer_exported(&mut p as *mut *mut _ as *mut *mut c_void, &mut x as *mut _ as *mut _);
-        //         // rcu_assign_pointer_exported(&mut p as *mut *mut _ as *mut *mut c_void, &mut y as *mut _ as *mut _);
-        //         rcu_read_unlock_exported();
-        //     }
-        // }
-
-        
         let mut ret = Err(Error::ENOSYS);
-
+        // handle the PR_SET_PTRACER operation
         if option == PR_SET_PTRACER as c_int {
+            // get current task thread group leader
             let myself = with_rcu_read_lock(|ctx| {
                 let current = TaskStructRef::current(event_ctx);
                 current.get_thread_group_leader(ctx).get_task_struct()
             });
-
             // no tracing permitted
             if arg2 == 0 {
-                // pr_info!("Removing tracee relationship!\n");
                 PTRACER_RELATIONS.del_relation(None, Some(myself.get_id()));
                 ret = Ok(());
+            // allow any tracer
             } else if arg2 as i32 == -1 {
-                // pr_info!("Adding tracee relationship: any tracer!\n");
-                PTRACER_RELATIONS.add_relation(PtraceRelation::AnyTracer { tracee: myself.get_id() });
+                PTRACER_RELATIONS.add_relation(PtraceRelation::AnyTracer {
+                    tracee: myself.get_id(),
+                });
                 ret = Ok(());
+            // allow a specific tracer
             } else {
-                // pr_info!("Adding tracee relationship!\n");
                 match TaskStruct::from_pid(arg2 as pid_t) {
                     Some(t) => {
                         PTRACER_RELATIONS.add_relation(PtraceRelation::TracerTracee {
@@ -648,34 +562,17 @@ impl SecurityModule for YamaRust {
                 }
             }
         }
-
-        // let b = unsafe { ktime_get() };
-
-        // unsafe {
-        //     times[times_count] = b-a;
-        //     times_count += 1;
-        //     if times_count == 1000 {
-        //         for i in 0..1000 {
-        //             pr_info!("prctl time: {}\n", times[i]);
-        //         }
-        //         times_count = 0;
-        //     }
-        // }
-
-        
-        // pr_info!("prctl time: {}\n", b-a);
-
         return ret;
     }
 
+    // security module initialization function
     #[link_section = ".init.text"]
     fn init(hooks: &'static mut SecurityHookList, init_ctx: InitContextRef<'_>) -> Result {
         pr_info!("Initializing Yama-Rust!\n");
-
+        // register security hooks
         hooks.register(init_ctx);
-
+        // register sysctl entry
         PTRACE_SCOPE_SYSCTL_ENTRY.register();
-
         Ok(())
     }
 }
